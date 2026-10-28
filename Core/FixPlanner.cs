@@ -103,6 +103,12 @@ public static class FixPlanner
                 case FixKind.ReleaseTimestamps:
                     plan.Retime = true;
                     break;
+
+                case FixKind.NoCommitInVersion:
+                    var revisionProject = apps.FirstOrDefault(a => a.RelPath.Equals(fix.Project, StringComparison.OrdinalIgnoreCase));
+                    if (revisionProject is null) plan.Skipped.Add($"Commit in the version: {fix.Project} isn't in the snapshot.");
+                    else PlanNoCommit(plan, snapshot, revisionProject, EditFor(plan, snapshot, edits, revisionProject.RelPath));
+                    break;
             }
         }
 
@@ -275,6 +281,49 @@ public static class FixPlanner
         }
 
         // First line counts as the change; the rest of the block is indented beneath it.
+        var lines = outcome.Line.Split('\n');
+        edit.Lines.Add("+ " + lines[0]);
+        edit.Lines.AddRange(lines.Skip(1).Select(l => "  " + l));
+    }
+
+    /// <summary>
+    /// Sets IncludeSourceRevisionInInformationalVersion to false: changes it where the project sets it,
+    /// otherwise adds it next to DebugType (including a DebugType this same batch adds), otherwise in a group of its own.
+    /// </summary>
+    private static void PlanNoCommit(FixPlan plan, RepoSnapshot snapshot, ProjectModel project, FileEdit? edit)
+    {
+        if (edit is null) return;
+        const string property = FixCatalog.SourceRevisionProperty;
+
+        var current = PropertyEvaluator.Evaluate(snapshot, project, property);
+        if (current is { State: EvalState.Set, Value: { } v } && v.Equals("false", StringComparison.OrdinalIgnoreCase))
+        {
+            plan.Skipped.Add($"Commit in the version: {project.RelPath} already has {property} false.");
+            return;
+        }
+
+        if (current.State != EvalState.NotSet)
+        {
+            // Set somewhere already: change it in place, and only in the project file itself.
+            if (!InProject(plan, project, property)) return;
+            Apply(plan, edit, property, "false");
+            return;
+        }
+
+        var outcome = edit.Editor.AddAfter("DebugType", property, "false", FixCatalog.NoCommitComment);
+        if (outcome.Kind == EditKind.Added)
+        {
+            edit.Lines.Add("+ " + outcome.Line);
+            return;
+        }
+
+        outcome = edit.Editor.AppendBlock(FixCatalog.NoCommitBlock);
+        if (outcome.Kind != EditKind.Added)
+        {
+            plan.Skipped.Add($"Commit in the version: {outcome.Reason}");
+            return;
+        }
+
         var lines = outcome.Line.Split('\n');
         edit.Lines.Add("+ " + lines[0]);
         edit.Lines.AddRange(lines.Skip(1).Select(l => "  " + l));

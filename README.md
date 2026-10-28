@@ -63,7 +63,7 @@ is the one exception: it is shown in indigo (see below).
 | Dark mode | Dark title bar, dark window background |
 | Dependencies | Third-party packages against the approved list, no loose DLL references, test project packages |
 | Security | Admin rights, web content combined with admin rights |
-| Build leaks | Deterministic compilation, no debug information, no build paths, machine values, build times or path-hashed names baked into the output |
+| Build leaks | Deterministic compilation, no debug information, no commit hash in the version, no build paths, machine values, build times or path-hashed names baked into the output |
 | Code | Single-file safe paths (no `Assembly.Location`), no AppData, writes next to the exe |
 
 The rules in more detail:
@@ -160,6 +160,12 @@ The rules in more detail:
 - **Version.** The app project's `<Version>` (or `VersionPrefix`), from the `.csproj` or a
   `Directory.Build.props` above it. None warns, because every build is then 1.0.0 and the header
   has no version to show; on a zip the Fix adds `<Version>1.0.0</Version>`.
+- **No commit in the version.** Every project that ends up in the exe needs
+  `<IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>`,
+  in the `.csproj` or a `.props` file. Without it the SDK appends `+<commit hash>` to the product
+  version whenever the build finds git information, so a build from a clone differs from one from a
+  zip and changes with every commit. Missing or `true` fails; on a zip the Fix adds it next to
+  `DebugType`, or in a group of its own when there's none.
 
 ## The window
 
@@ -199,7 +205,7 @@ runtime it's running on.
 - **Show in Explorer** opens the snapshot's folder.
 - **Fix.** Some findings on zip snapshots can be fixed: remove solution files, obsolete IDE
   files, git files or the unlisted files you tick, add the publish settings or a version, turn
-  off debug information, or set release timestamps. Queue the fixes, then press **Apply**. A
+  off debug information, keep the commit out of the version, or set release timestamps. Queue the fixes, then press **Apply**. A
   preview lists every change before anything is written. The fixed copy goes to Downloads,
   every file dated the release date at 00:00:00, and the history folder stays as it is. It keeps
   the private files: it goes through RepoBuilder before anything is published.
@@ -289,7 +295,7 @@ dotnet publish AppConsistency/AppConsistency.csproj -c Release -r win-x64 --self
 ```
 
 No third-party packages. The publish settings (single file, native libraries included,
-compression, no debug information) are already in the csproj.
+compression, no debug information, no commit hash in the version) are already in the csproj.
 
 ## Versioning
 

@@ -10,7 +10,7 @@
     <AssemblyName>AppConsistency</AssemblyName>
     <Product>AppConsistency</Product>
     <!-- Major and minor stay put; only the build number goes up, with every delivery. -->
-    <Version>1.0.15</Version>
+    <Version>1.0.16</Version>
 
     <ApplicationIcon>app.ico</ApplicationIcon>
 
@@ -20,6 +20,8 @@
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <DebugType>none</DebugType>
+    <!-- No commit hash appended to the product version: a build from a git clone matches one from a zip. -->
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
 
   <ItemGroup>

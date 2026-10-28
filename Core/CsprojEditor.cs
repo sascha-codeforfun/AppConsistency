@@ -95,6 +95,39 @@ public sealed class CsprojEditor
     }
 
     /// <summary>
+    /// Adds a property on the line after the last unconditional definition of <paramref name="anchor"/>,
+    /// at the same indent, with an optional comment line above it. Blocked when there's no such anchor.
+    /// </summary>
+    public EditOutcome AddAfter(string anchor, string name, string value, string? comment = null)
+    {
+        var line = $"<{name}>{value}</{name}>";
+        var masked = Mask(Text);
+        var escaped = Regex.Escape(anchor);
+        var element = new Regex($@"<{escaped}(?<attrs>\s[^>]*?)?>[^<]*</{escaped}\s*>", RegexOptions.IgnoreCase);
+
+        Match? last = null;
+        foreach (var group in FindGroups(masked).Where(g => !g.SelfClosing && !g.Conditional))
+        {
+            foreach (Match match in element.Matches(masked, group.BodyStart))
+            {
+                if (match.Index + match.Length > group.BodyEnd) break;
+                if (match.Groups["attrs"].Value.Contains("Condition", StringComparison.OrdinalIgnoreCase)) continue;
+                last = match;
+            }
+        }
+
+        if (last is null)
+            return new EditOutcome(EditKind.Blocked, line, Reason: $"No unconditional {anchor} to add it next to.");
+
+        int lineStart = masked.LastIndexOf('\n', Math.Max(0, last.Index - 1)) + 1;
+        var indent = new string(masked[lineStart..last.Index].TakeWhile(c => c is ' ' or '\t').ToArray());
+
+        var insert = (comment is null ? "" : NewLine + indent + comment) + NewLine + indent + line;
+        Text = Text.Insert(last.Index + last.Length, insert);
+        return new EditOutcome(EditKind.Added, line);
+    }
+
+    /// <summary>
     /// Appends a block as the last thing before &lt;/Project&gt;, separated by a blank line.
     /// Template lines use {0} for the file's top-level indent and {1} for the indent of their children.
     /// </summary>

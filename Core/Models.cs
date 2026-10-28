@@ -27,7 +27,8 @@ public enum FixKind
     RemoveGitFiles,
     RemoveUnlistedFiles,
     AddVersion,
-    ReleaseTimestamps
+    ReleaseTimestamps,
+    NoCommitInVersion
 }
 
 /// <summary>Whether the app uses NuGet packages, and whether they're all on the approved list.</summary>

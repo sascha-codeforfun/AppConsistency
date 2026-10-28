@@ -1436,6 +1436,9 @@ public static class StandardsRules
             }
         }
 
+        foreach (var project in apps.OrderBy(a => a.RelPath, StringComparer.OrdinalIgnoreCase))
+            SourceRevisionRule(s, project, apps.Count, r);
+
         // [CallerFilePath] bakes the caller's full source path into the code as a string, whatever DebugType says.
         const string callerRule = "No source paths in the code";
         var uses = new List<(SnapshotFile File, int Line, ProjectModel? Project)>();
@@ -1498,6 +1501,48 @@ public static class StandardsRules
 
     // A3: a compiler-generated file-local type name, as it appears in an assembly.
     private static readonly Regex PathHashedTypeName = new(@"F[0-9A-F]{64}__\w+", RegexOptions.Compiled);
+
+    private const string SourceRevisionProperty = "IncludeSourceRevisionInInformationalVersion";
+
+    /// <summary>
+    /// Since .NET 8 the SDK appends "+&lt;commit hash&gt;" to the informational (product) version whenever
+    /// it finds source-control information, so a build from a git clone differs from one from a zip,
+    /// and changes with every commit. Only an explicit false keeps the version as written.
+    /// </summary>
+    private static void SourceRevisionRule(RepoSnapshot s, ProjectModel project, int appCount, List<CheckResult> r)
+    {
+        var name = Path.GetFileNameWithoutExtension(project.RelPath);
+        var rule = appCount == 1 ? "No commit in the version" : $"No commit in the version ({name})";
+        var result = PropertyEvaluator.Evaluate(s, project, SourceRevisionProperty);
+        var fix = s.IsZip ? FixKind.NoCommitInVersion : FixKind.None;
+        const string why = "the SDK appends the commit hash to the product version whenever the build finds git information: " +
+                           "a build from a clone then differs from one from a zip, and changes with every commit";
+
+        switch (result.State)
+        {
+            case EvalState.Set when string.Equals(result.Value, "false", StringComparison.OrdinalIgnoreCase):
+                r.Report(Leaks, rule, CheckStatus.Pass, $"{SourceRevisionProperty} is false (set in {result.Source}).");
+                break;
+
+            case EvalState.Set:
+                r.Report(Leaks, rule, CheckStatus.Fail,
+                    $"{SourceRevisionProperty} is {result.Value} (set in {result.Source}), so {why}.",
+                    fix, project.RelPath);
+                break;
+
+            case EvalState.NotSet:
+                r.Report(Leaks, rule, CheckStatus.Fail,
+                    $"{SourceRevisionProperty} isn't set to false, so {why}.",
+                    fix, project.RelPath);
+                break;
+
+            default:
+                r.Report(Leaks, rule, CheckStatus.Info,
+                    $"Couldn't be determined: {SourceRevisionProperty} {result.Value} is set in {result.Source} under a condition AppConsistency can't evaluate ({result.Condition}).",
+                    fix, project.RelPath);
+                break;
+        }
+    }
 
     // B: MSBuild property functions that read the clock, the machine or a random value.
     private static readonly Regex BuildTimeValue = new(

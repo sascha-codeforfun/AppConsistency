@@ -19,6 +19,23 @@ public static class FixCatalog
         "{0}</PropertyGroup>",
     ];
 
+    /// <summary>The property that keeps the commit hash out of the product version.</summary>
+    public const string SourceRevisionProperty = "IncludeSourceRevisionInInformationalVersion";
+
+    /// <summary>The comment written above the property when it's added next to DebugType.</summary>
+    public const string NoCommitComment =
+        "<!-- No commit hash appended to the product version: a build from a git clone matches one from a zip. -->";
+
+    /// <summary>The group the no-commit fix appends when the project has no DebugType to sit next to.</summary>
+    public static string[] NoCommitBlock =>
+    [
+        "{0}<!-- Reproducible builds: no commit hash appended to the product version,",
+        "{0}     so a build from a git clone matches one from a zip. -->",
+        "{0}<PropertyGroup>",
+        "{1}<" + SourceRevisionProperty + ">false</" + SourceRevisionProperty + ">",
+        "{0}</PropertyGroup>",
+    ];
+
     /// <summary>The version the "add a version" fix writes into a project that has none.</summary>
     public const string FirstVersion = "1.0.0";
 
@@ -32,6 +49,7 @@ public static class FixCatalog
         FixKind.RemoveUnlistedFiles => "Remove the unlisted files you tick",
         FixKind.AddVersion => "Add <Version>1.0.0</Version>",
         FixKind.ReleaseTimestamps => "Set release timestamps",
+        FixKind.NoCommitInVersion => "Keep the commit out of the version",
         _ => kind.ToString()
     };
 }
