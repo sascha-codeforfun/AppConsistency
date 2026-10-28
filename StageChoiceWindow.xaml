@@ -1,0 +1,29 @@
+<Window x:Class="AppConsistency.StageChoiceWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Style="{StaticResource Hue.Window}"
+        Title="AppConsistency"
+        Width="820" SizeToContent="Height" ResizeMode="CanResize" MinWidth="560"
+        WindowStartupLocation="CenterOwner" ShowInTaskbar="False">
+    <Border Background="{DynamicResource Brush.Surface}" Padding="28,24">
+        <StackPanel>
+            <TextBlock x:Name="HeadingText" Style="{StaticResource Text.Heading}" TextWrapping="Wrap" />
+            <TextBlock x:Name="BodyText" Style="{StaticResource Text.Body}" TextWrapping="Wrap" Margin="0,8,0,0" />
+            <Border Background="{DynamicResource Brush.Base}"
+                    BorderBrush="{DynamicResource Brush.LineSoft}" BorderThickness="1"
+                    CornerRadius="{StaticResource Radius.Card}" Padding="14,12" Margin="0,18,0,0">
+                <ScrollViewer MaxHeight="320" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                    <TextBlock x:Name="DetailsText" Style="{StaticResource Text.Mono}" TextWrapping="Wrap" />
+                </ScrollViewer>
+            </Border>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,24,0,0">
+                <Button x:Name="CancelButton" Content="Cancel" IsCancel="True" IsDefault="True"
+                        MinWidth="96" Margin="0,0,10,0" />
+                <Button x:Name="WithButton" Content="With private files" MinWidth="96" Margin="0,0,10,0"
+                        Click="With_Click" />
+                <Button x:Name="PublishButton" Content="Without (for publishing)" Style="{StaticResource Hue.Button.Primary}"
+                        MinWidth="96" Click="Publish_Click" />
+            </StackPanel>
+        </StackPanel>
+    </Border>
+</Window>

@@ -1,0 +1,43 @@
+<Window x:Class="AppConsistency.UnlistedPickWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Style="{StaticResource Hue.Window}"
+        Title="AppConsistency"
+        Width="820" SizeToContent="Height" ResizeMode="CanResize" MinWidth="560"
+        WindowStartupLocation="CenterOwner" ShowInTaskbar="False">
+    <Border Background="{DynamicResource Brush.Surface}" Padding="28,24">
+        <StackPanel>
+            <TextBlock x:Name="HeadingText" Style="{StaticResource Text.Heading}" TextWrapping="Wrap" />
+            <TextBlock x:Name="BodyText" Style="{StaticResource Text.Body}" TextWrapping="Wrap" Margin="0,8,0,0" />
+            <TextBlock x:Name="WhitelistText" Style="{StaticResource Text.Caption}" TextWrapping="Wrap" Margin="0,8,0,0" />
+            <Border Background="{DynamicResource Brush.Base}"
+                    BorderBrush="{DynamicResource Brush.LineSoft}" BorderThickness="1"
+                    CornerRadius="{StaticResource Radius.Card}" Padding="14,12" Margin="0,18,0,0">
+                <ScrollViewer MaxHeight="440" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                    <StackPanel x:Name="ListPanel" />
+                </ScrollViewer>
+            </Border>
+            <Grid Margin="0,24,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <StackPanel Orientation="Horizontal">
+                    <Button x:Name="TickAllButton" Content="Tick all" Style="{StaticResource Hue.Button.Ghost}"
+                            Click="TickAll_Click" Margin="0,0,8,0" />
+                    <Button x:Name="UntickAllButton" Content="Untick all" Style="{StaticResource Hue.Button.Ghost}"
+                            Click="UntickAll_Click" />
+                </StackPanel>
+                <TextBlock x:Name="CountText" Grid.Column="1" Style="{StaticResource Text.Caption}"
+                           VerticalAlignment="Center" Margin="16,0" />
+                <StackPanel Grid.Column="2" Orientation="Horizontal">
+                    <Button x:Name="CancelButton" Content="Cancel" IsCancel="True" IsDefault="True"
+                            MinWidth="96" Margin="0,0,10,0" />
+                    <Button x:Name="ConfirmButton" Content="Queue removal" Style="{StaticResource Hue.Button.Primary}"
+                            MinWidth="96" IsEnabled="False" Click="Confirm_Click" />
+                </StackPanel>
+            </Grid>
+        </StackPanel>
+    </Border>
+</Window>
