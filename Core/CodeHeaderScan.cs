@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using CSharpLexing;
 
 namespace AppConsistency.Core;
 
@@ -8,11 +9,6 @@ namespace AppConsistency.Core;
 /// </summary>
 public static class CodeHeaderScan
 {
-    // Strings, chars and comments; blanked out so braces inside them don't count.
-    private static readonly Regex Noise = new(
-        @"@""(?:""""|[^""])*""|\$?""(?:\\.|[^""\\\n])*""|'(?:\\.|[^'\\\n])+'|//[^\n]*|/\*.*?\*/",
-        RegexOptions.Singleline | RegexOptions.Compiled);
-
     private static readonly Regex TextElement = new(
         @"new\s+(?:System\.Windows\.Controls\.)?(?:TextBlock|Label)\s*(?:\(\s*\))?\s*\{(?<init>[^{}]*)\}",
         RegexOptions.Compiled);
@@ -31,14 +27,19 @@ public static class CodeHeaderScan
     /// <summary>Returns null when the image name isn't found in the code.</summary>
     public static Result? Inspect(string code, string imageName)
     {
-        int reference = code.IndexOf(imageName, StringComparison.OrdinalIgnoreCase);
+        // A mention in a comment doesn't count; the name itself sits in a string, so strings stay.
+        var text = CSharpLexer.BlankComments(code);
+        int reference = text.IndexOf(imageName, StringComparison.OrdinalIgnoreCase);
         if (reference < 0) return null;
 
         var masked = Mask(code);
         var (start, end, name) = EnclosingMethod(masked, reference);
 
-        var body = code[start..end];
-        int lines = TextElement.Matches(body).Count(m => TextSet.IsMatch(m.Groups["init"].Value));
+        // The elements are found where their braces are code, so a brace inside a string
+        // ($"{name}", "{0}") doesn't cut an initializer short; what they're set to is read with the
+        // strings in place, at the same positions.
+        int lines = TextElement.Matches(masked[start..end])
+            .Count(m => TextSet.IsMatch(text.Substring(start + m.Groups["init"].Index, m.Groups["init"].Length)));
         return new Result(name, lines);
     }
 
@@ -102,13 +103,6 @@ public static class CodeHeaderScan
         return -1;
     }
 
-    /// <summary>Blanks out strings, chars and comments, keeping length and line breaks.</summary>
-    public static string Mask(string code) =>
-        Noise.Replace(code, m =>
-        {
-            var chars = m.Value.ToCharArray();
-            for (int i = 0; i < chars.Length; i++)
-                if (chars[i] is not ('\r' or '\n')) chars[i] = ' ';
-            return new string(chars);
-        });
+    /// <summary>Blanks out strings, chars, comments and directives, keeping length and line breaks. Interpolation holes stay as code.</summary>
+    public static string Mask(string code) => CSharpLexer.BlankCommentsAndStrings(code);
 }

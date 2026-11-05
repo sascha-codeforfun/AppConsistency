@@ -33,7 +33,7 @@ public static class ReportBuilder
                 sb.AppendLine();
                 sb.AppendLine(category);
             }
-            sb.AppendLine($"  {result.StatusLabel,-4}  {result.Rule}: {Indent(result.Detail, 8)}");
+            sb.AppendLine($"  {result.StatusLabel,-6}  {result.Rule}: {Indent(result.Detail, 10)}");
         }
 
         return sb.ToString();
@@ -73,6 +73,8 @@ public static class ReportBuilder
             {
                 if (r.Status is CheckStatus.Fail or CheckStatus.Warn)
                     sb.AppendLine($"    {r.StatusLabel,-4}  {r.Category} / {r.Rule}: {Indent(r.Detail, 10)}");
+                else if (r.ExemptReason is not null)
+                    sb.AppendLine($"    EXEMPT {r.Category} / {r.Rule}: {r.ExemptReason}");
                 else if (r.Status == CheckStatus.License && app.NeedsLicenseReview)
                     sb.AppendLine($"    LIC   {r.Category} / {r.Rule}: review license. {Indent(r.Detail, 10)}");
             }

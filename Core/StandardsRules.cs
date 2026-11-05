@@ -2,6 +2,7 @@ using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Windows.Media;
+using CSharpLexing;
 using System.Xml.Linq;
 
 namespace AppConsistency.Core;
@@ -84,10 +85,12 @@ public static class StandardsRules
         @"^\{\s*(?:StaticResource|DynamicResource)\s+(?:ResourceKey\s*=\s*)?(?<key>[^\s}]+)\s*\}$",
         RegexOptions.Compiled);
 
-    public static List<CheckResult> Run(RepoSnapshot snapshot, out ScanFacts facts)
+    /// <param name="appName">The app folder's name, which exemptions are matched against; empty applies none.</param>
+    public static List<CheckResult> Run(RepoSnapshot snapshot, out ScanFacts facts, string appName = "")
     {
         var results = new List<CheckResult>();
         facts = new ScanFacts();
+        var exemptions = new ExemptionMatcher(appName);
         facts.AllFiles.AddRange(snapshot.Files.Select(f => f.RelPath));
 
         PackageRules(snapshot, results, facts);
@@ -133,8 +136,11 @@ public static class StandardsRules
         ReproducibleRules(snapshot, appFiles, SelectProjects(snapshot).Apps, results);
         LeakRules(snapshot, appFiles, results);
         CodeRules(appFiles, results);
-        WriteRules(appFiles, project, results);
+        WriteRules(appFiles, project, results, exemptions);
 
+        exemptions.ApplyTo(results);
+        exemptions.ReportUnused(results);
+        facts.ExemptionUses = exemptions.Uses;
         return results;
     }
 
@@ -537,7 +543,28 @@ public static class StandardsRules
         var verdict = LicenseCheck.Inspect(s);
         facts.Licenses.AddRange(verdict.Files);
         facts.LicenseIsMit = verdict.IsMit;
-        r.Add(new CheckResult(Project, "License", CheckStatus.License, verdict.Detail) { PillWord = verdict.IsMit ? "MIT" : "license" });
+        var detail = verdict.Detail;
+        var fix = FixKind.None;
+
+        // Only when there's no license at all: an existing one, MIT or not, is never replaced.
+        if (verdict.Files.Count == 0 && s.IsZip)
+        {
+            var holder = Core.Standard.Current.LicenseHolder;
+            if (holder.Length == 0)
+                detail += " Set the license holder in Settings and the Fix can add it.";
+            else if (!LicenseCheck.IsFullName(holder))
+                detail += $" The license holder in Settings, \"{holder}\", isn't a full name of two or more words, so the Fix can't add it.";
+            else if (s.WrapperFolder is null)
+                detail += " The Fix needs a single wrapper folder to put it in.";
+            else
+                fix = FixKind.AddMitLicense;
+        }
+
+        r.Add(new CheckResult(Project, "License", CheckStatus.License, detail)
+        {
+            PillWord = verdict.IsMit ? "MIT" : "license",
+            Fix = fix
+        });
     }
 
     /// <summary>The header shows the app's version, so the project has to set one.</summary>
@@ -795,8 +822,8 @@ public static class StandardsRules
         const string resourceRule = "Header image resource";
         if (resource is not null)
             r.Report(Icons, resourceRule, CheckStatus.Pass, $"Included as <Resource Include=\"{resource.Include}\" />.");
-        else if (embedded is not null && files.Any(f => f.Extension == ".cs"
-                     && f.Text?.Contains("GetManifestResourceStream", StringComparison.Ordinal) == true))
+        else if (embedded is not null && files.Any(f => f.Extension == ".cs" && f.Text is not null
+                     && CSharpLexer.BlankCommentsAndStrings(f.Text).Contains("GetManifestResourceStream", StringComparison.Ordinal)))
             r.Report(Icons, resourceRule, CheckStatus.Pass,
                 "Included as EmbeddedResource and read with GetManifestResourceStream.");
         else if (embedded is not null)
@@ -900,8 +927,10 @@ public static class StandardsRules
 
         if (xamlRefs.Count == 0)
         {
+            // As with the XAML above, a mention in a comment doesn't count. The name is in a string, so strings stay.
             var code = files.FirstOrDefault(f =>
-                f.Extension == ".cs" && f.Text?.Contains(HeaderImageName, StringComparison.OrdinalIgnoreCase) == true);
+                f.Extension == ".cs" && f.Text is not null
+                && CSharpLexer.BlankComments(f.Text).Contains(HeaderImageName, StringComparison.OrdinalIgnoreCase));
 
             if (code is not null)
             {
@@ -1007,8 +1036,12 @@ public static class StandardsRules
     private static void DarkTitleBarRule(IReadOnlyList<SnapshotFile> files, List<CheckResult> r)
     {
         const string rule = "Dark title bar";
+        // Comments blanked, strings kept: a commented-out call doesn't count, and the name can be in a
+        // string (EntryPoint = "DwmSetWindowAttribute").
         var calls = files
-            .Where(f => f.Extension == ".cs" && f.Text?.Contains("DwmSetWindowAttribute", StringComparison.Ordinal) == true)
+            .Where(f => f.Extension == ".cs" && f.Text is not null)
+            .Select(f => (File: f, Code: CSharpLexer.BlankComments(f.Text!)))
+            .Where(c => c.Code.Contains("DwmSetWindowAttribute", StringComparison.Ordinal))
             .ToList();
 
         if (calls.Count == 0)
@@ -1017,12 +1050,12 @@ public static class StandardsRules
             return;
         }
 
-        var dark = calls.FirstOrDefault(f => DarkModeAttribute.IsMatch(f.Text!));
+        var dark = calls.FirstOrDefault(c => DarkModeAttribute.IsMatch(c.Code)).File;
         if (dark is not null)
             r.Report(Dark, rule, CheckStatus.Pass, $"Immersive dark mode is set in {dark.RelPath}.");
         else
             r.Report(Dark, rule, CheckStatus.Warn,
-                $"DwmSetWindowAttribute is called in {calls[0].Name}, but not with the dark mode attribute (19 or 20).");
+                $"DwmSetWindowAttribute is called in {calls[0].File.Name}, but not with the dark mode attribute (19 or 20).");
     }
 
     private static void DarkBackgroundRule(IReadOnlyList<SnapshotFile> files, List<CheckResult> r)
@@ -1065,7 +1098,8 @@ public static class StandardsRules
 
         if (windows.Count == 0)
         {
-            var codeWindow = files.FirstOrDefault(f => f.Extension == ".cs" && f.Text is not null && CodeWindowClass.IsMatch(f.Text));
+            var codeWindow = files.FirstOrDefault(f => f.Extension == ".cs" && f.Text is not null
+                                                       && CodeWindowClass.IsMatch(CSharpLexer.BlankCommentsAndStrings(f.Text)));
             if (codeWindow is not null)
                 r.Report(Dark, rule, CheckStatus.Info,
                     $"Windows are built in code ({codeWindow.Name}), so their background colour isn't checked.");
@@ -1825,7 +1859,8 @@ public static class StandardsRules
     {
         const string rule = "Single-file safe paths";
         var hits = files
-            .Where(f => f.Extension == ".cs" && f.Text is not null && AssemblyLocationUse.IsMatch(f.Text))
+            .Where(f => f.Extension == ".cs" && f.Text is not null
+                        && AssemblyLocationUse.IsMatch(CSharpLexer.BlankCommentsAndStrings(f.Text)))
             .Select(f => f.Name)
             .ToList();
 
@@ -1841,7 +1876,7 @@ public static class StandardsRules
     /// belong in AssemblyName.json next to the exe; anything else written there, and temp files, are
     /// listed so you see them. Read from the code; nothing is run.
     /// </summary>
-    private static void WriteRules(IReadOnlyList<SnapshotFile> files, ProjectModel? project, List<CheckResult> r)
+    private static void WriteRules(IReadOnlyList<SnapshotFile> files, ProjectModel? project, List<CheckResult> r, ExemptionMatcher exemptions)
     {
         var assembly = project?.Prop("AssemblyName")
                        ?? (project is null ? "" : Path.GetFileNameWithoutExtension(project.RelPath));
@@ -1858,19 +1893,33 @@ public static class StandardsRules
         var sites = WriteScan.Scan(compiled, assembly);
         var settings = assembly.Length == 0 ? "AssemblyName.json" : assembly + ".json";
 
-        string Line(WriteSite w) => $"\n  {w.File} line {w.Line}: {w.Call} → {w.Via}";
+        string Line(WriteSite w) => $"\n  {w.File} line {w.Line}: {w.Call} → {w.Via}" + (w.Method is null ? "" : $", in {w.Method}");
 
-        var appData = sites.Where(w => w.Target == WriteTarget.AppData).ToList();
+        // Each AppData write is checked against the exemptions on its own: only the ones covered drop out.
+        const string appDataRule = "No AppData";
+        var checkedSites = sites
+            .Where(w => w.Target == WriteTarget.AppData)
+            .Select(w => (Site: w, Hits: exemptions.ForSite(appDataRule, w)))
+            .ToList();
+        var appData = checkedSites.Where(x => x.Hits.Count == 0).Select(x => x.Site).ToList();
+        var covered = checkedSites.Where(x => x.Hits.Count > 0).ToList();
+        var coveredReasons = ExemptionMatcher.Reasons(covered.SelectMany(x => x.Hits));
+        var coveredLines = string.Concat(covered.Select(x => Line(x.Site)));
         var temp = sites.Where(w => w.Target == WriteTarget.Temp).ToList();
         var tempNote = temp.Count == 0 ? ""
             : $"\nAlso writes to the temp folder ({Plural(temp.Count, "place")}), listed for information:" + string.Concat(temp.Select(Line));
 
-        const string appDataRule = "No AppData";
         if (appData.Count > 0)
             r.Report(Code, appDataRule, CheckStatus.Fail,
                 $"Writes under the user's AppData in {Plural(appData.Count, "place")}. Files there are left behind when the app " +
                 $"is gone. Store settings in {settings} next to the exe (AppContext.BaseDirectory) instead." +
-                string.Concat(appData.Select(Line)) + tempNote);
+                string.Concat(appData.Select(Line)) +
+                (covered.Count == 0 ? "" : $"\nExempt ({Plural(covered.Count, "place")}): {coveredReasons}" + coveredLines) +
+                tempNote);
+        else if (covered.Count > 0)
+            r.Add(new CheckResult(Code, appDataRule, CheckStatus.Info,
+                $"Exempt: {coveredReasons}\nWrites under the user's AppData in {Plural(covered.Count, "place")}:" + coveredLines + tempNote)
+                { ExemptReason = coveredReasons });
         else if (temp.Count > 0)
             r.Report(Code, appDataRule, CheckStatus.Info,
                 "Nothing written under AppData. Writes to the temp folder, which is up to the app to clean up:" + string.Concat(temp.Select(Line)));

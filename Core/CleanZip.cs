@@ -17,6 +17,9 @@ public sealed class ZipChanges
     /// <summary>New content for existing files (edited project files).</summary>
     public Dictionary<string, byte[]> Replace { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>Files that aren't in the source zip yet (a generated license), by entry name.</summary>
+    public Dictionary<string, byte[]> Add { get; } = new(StringComparer.Ordinal);
+
     public bool Removes(string rel) =>
         RemoveFiles.Contains(rel)
         || RemoveNames.Contains(RepoSnapshot.NameOf(rel))
@@ -92,31 +95,47 @@ public static class CleanZip
                 || keptFiles.Any(o => RepoSnapshot.IsSameOrUnder(o.Rel, e.Rel)))
             .ToList();
 
+        // New files sort in among the existing ones; one whose name is already taken is left out,
+        // since a file is never added over one the zip already has.
+        var taken = new HashSet<string>(entries.Select(e => e.Rel), StringComparer.OrdinalIgnoreCase);
+        var added = (changes?.Add ?? new Dictionary<string, byte[]>())
+            .Where(a => !taken.Contains(RepoSnapshot.Normalize(a.Key)))
+            .Select(a => (Name: a.Key, Entry: (ZipArchiveEntry?)null, Rel: RepoSnapshot.Normalize(a.Key), IsDir: false, Bytes: (byte[]?)a.Value));
+
+        var items = keptFiles.Concat(keptDirs)
+            .Select(e => (Name: e.Entry.FullName, Entry: (ZipArchiveEntry?)e.Entry, e.Rel, e.IsDir, Bytes: (byte[]?)null))
+            .Concat(added)
+            .OrderBy(e => e.Name, StringComparer.Ordinal);
+
         var names = new HashSet<string>(StringComparer.Ordinal);
         using var zip = new ZipArchive(output, ZipArchiveMode.Create, leaveOpen: true);
 
-        foreach (var item in keptFiles.Concat(keptDirs).OrderBy(e => e.Entry.FullName, StringComparer.Ordinal))
+        foreach (var item in items)
         {
-            if (!names.Add(item.Entry.FullName)) continue;   // a duplicate name would only confuse the extract
+            if (!names.Add(item.Name)) continue;   // a duplicate name would only confuse the extract
 
             if (item.IsDir)
             {
-                var folder = zip.CreateEntry(item.Entry.FullName, CompressionLevel.NoCompression);
+                var folder = zip.CreateEntry(item.Name, CompressionLevel.NoCompression);
                 folder.LastWriteTime = stamp;
                 continue;
             }
 
-            var entry = zip.CreateEntry(item.Entry.FullName, CompressionLevel.Optimal);
+            var entry = zip.CreateEntry(item.Name, CompressionLevel.Optimal);
             entry.LastWriteTime = stamp;
             using var target = entry.Open();
 
-            if (changes is not null && changes.Replace.TryGetValue(item.Rel, out var bytes))
+            if (item.Bytes is not null)
+            {
+                target.Write(item.Bytes);
+            }
+            else if (changes is not null && changes.Replace.TryGetValue(item.Rel, out var bytes))
             {
                 target.Write(bytes);
             }
             else
             {
-                using var content = item.Entry.Open();
+                using var content = item.Entry!.Open();
                 content.CopyTo(target);
             }
         }

@@ -61,6 +61,39 @@ public static class LicenseCheck
 
     public static bool IsLicenseName(string fileName) => LicenseName.IsMatch(fileName);
 
+    /// <summary>A name the check accepts on the copyright line: two or more words of letters.</summary>
+    public static bool IsFullName(string name) => FullName.IsMatch(name.Trim());
+
+    /// <summary>
+    /// The standard MIT license, wrapped as it's usually published, with LF line endings and a final
+    /// line break. The same year and holder always give the same bytes.
+    /// </summary>
+    public static string StandardText(int year, string holder) => string.Join("\n",
+    [
+        Title,
+        "",
+        $"Copyright (c) {year} {holder.Trim()}",
+        "",
+        "Permission is hereby granted, free of charge, to any person obtaining a copy",
+        "of this software and associated documentation files (the \"Software\"), to deal",
+        "in the Software without restriction, including without limitation the rights",
+        "to use, copy, modify, merge, publish, distribute, sublicense, and/or sell",
+        "copies of the Software, and to permit persons to whom the Software is",
+        "furnished to do so, subject to the following conditions:",
+        "",
+        "The above copyright notice and this permission notice shall be included in all",
+        "copies or substantial portions of the Software.",
+        "",
+        "THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR",
+        "IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,",
+        "FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE",
+        "AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER",
+        "LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,",
+        "OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE",
+        "SOFTWARE.",
+        ""
+    ]);
+
     public static List<string> Find(RepoSnapshot s) =>
         s.Files
             .Where(f => IsLicenseName(f.Name) && !InSkippedFolder(f.RelPath))

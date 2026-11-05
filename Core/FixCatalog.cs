@@ -36,6 +36,9 @@ public static class FixCatalog
         "{0}</PropertyGroup>",
     ];
 
+    /// <summary>The file the MIT fix writes, in the wrapper folder.</summary>
+    public const string LicenseFileName = "LICENSE.txt";
+
     /// <summary>The version the "add a version" fix writes into a project that has none.</summary>
     public const string FirstVersion = "1.0.0";
 
@@ -50,6 +53,7 @@ public static class FixCatalog
         FixKind.AddVersion => "Add <Version>1.0.0</Version>",
         FixKind.ReleaseTimestamps => "Set release timestamps",
         FixKind.NoCommitInVersion => "Keep the commit out of the version",
+        FixKind.AddMitLicense => "Add the MIT license",
         _ => kind.ToString()
     };
 }

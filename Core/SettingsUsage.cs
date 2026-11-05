@@ -74,6 +74,22 @@ public static class SettingsUsage
             $"matches {files:N0} file{(files == 1 ? "" : "s")} in {lines.Count} of {Apps(scanned.Count)}");
     }
 
+    /// <summary>How many findings an exemption covered in its app at the last scan, or that the app wasn't there.</summary>
+    public static Usage Exemption(ExemptionEntry entry, IReadOnlyList<AppAudit> apps)
+    {
+        var scanned = Scanned(apps);
+        if (scanned.Count == 0) return new Usage(0, 0, [], "not scanned yet");
+
+        var app = scanned.FirstOrDefault(a => a.AppName.Equals(entry.App.Trim(), StringComparison.OrdinalIgnoreCase));
+        if (app is null) return new Usage(0, 1, [], $"no app named {entry.App} in the last scan");
+
+        int covered = app.ExemptionUses.GetValueOrDefault(entry.Key);
+        return covered == 0
+            ? new Usage(0, 1, [], $"covers nothing in {app.AppName} at the last scan")
+            : new Usage(1, 1, [$"{app.AppName}: {covered} finding{(covered == 1 ? "" : "s")}"],
+                $"covers {covered} finding{(covered == 1 ? "" : "s")} in {app.AppName}");
+    }
+
     private static List<AppAudit> Scanned(IReadOnlyList<AppAudit> apps) =>
         apps.Where(a => !a.Skipped && !a.Pending && a.SnapshotPath is not null).ToList();
 

@@ -131,8 +131,11 @@ The rules in more detail:
   `SpecialFolder.ApplicationData`, `%LOCALAPPDATA%`, `%APPDATA%`, a literal `AppData\` path). Each
   write is listed with its file and line. Reading or deleting there doesn't count. Writes to the
   temp folder are listed as Info: temp is meant for that, and only the app knows whether it cleans
-  up. Code a project leaves out of its build (`<Compile Remove>`) and test projects are skipped. A
-  path assembled in ways the check can't follow is missed, never guessed.
+  up. Code a project leaves out of its build (`<Compile Remove>`) and test projects are skipped.
+  Paths built with string interpolation are followed through their holes:
+  `$"{AppContext.BaseDirectory}\\{name}.json"` leads to the exe's folder. Text inside strings and
+  comments is never taken for a call or a definition. A path assembled in ways the check can't
+  follow is missed, never guessed.
 - **Writes next to the exe.** `AssemblyName.json` there is the settings standard. Anything else
   written next to the exe (other settings names, logs, caches) is listed as Info, since a read-only
   folder such as Program Files makes those writes fail.
@@ -157,6 +160,11 @@ The rules in more detail:
   `LICENSE`, `LICENCE` and `COPYING`, bare or as `.md` or `.txt`, count, in any letter case and
   any folder outside build output. When there are several, all are listed and the first one at the
   shallowest level is checked.
+
+  With no license file at all, on a zip, the Fix adds the standard MIT license as `LICENSE.txt` in
+  the wrapper folder: the release date's year and the license holder from *Settings*, UTF-8 with LF
+  line endings, so the same year and name always give the same file. It's only offered once the
+  license holder is set, and it never replaces or edits a license that's already there.
 - **Version.** The app project's `<Version>` (or `VersionPrefix`), from the `.csproj` or a
   `Directory.Build.props` above it. None warns, because every build is then 1.0.0 and the header
   has no version to show; on a zip the Fix adds `<Version>1.0.0</Version>`.
@@ -166,6 +174,44 @@ The rules in more detail:
   version whenever the build finds git information, so a build from a clone differs from one from a
   zip and changes with every commit. Missing or `true` fails; on a zip the Fix adds it next to
   `DebugType`, or in a group of its own when there's none.
+
+## Exemptions
+
+Sometimes an app has a real reason to break a rule. An exemption in your `AppConsistency.json` (or
+in *Settings*) records it, with the reason:
+
+```json
+"Standard": {
+  "Exemptions": [
+    {
+      "Rule": "No AppData",
+      "App": "EremitVM",
+      "File": "Services/ConsolePreset.cs",
+      "Method": "Ensure",
+      "Origin": "ApplicationData",
+      "Reason": "VMConnect's own per-VM settings file; VMConnect reads it only from its own AppData folder. Removed with the VM."
+    }
+  ]
+}
+```
+
+- `Rule`, `App` and `Reason` are required. `Rule` is the name as the findings show it; a project's
+  own row of a rule, like *No debug information (Core)*, counts as that rule. `App` is the app's
+  folder name in the history folder.
+- `File`, `Method` and `Origin` narrow it, and each one given has to match. `File` is the end of a
+  path, at a folder boundary. `Method` (the method a write sits in) and `Origin` (where it points:
+  `ApplicationData`, `LocalApplicationData`, a whole word of what the finding shows) apply to the
+  write checks, where every write is matched on its own: a new AppData write somewhere else still
+  fails. On other rules, `File` means the finding mentions that file.
+- Only findings that warn or fail can be exempted. A covered finding shows a grey **Exempt** pill
+  with the reason above the original detail, and no longer makes the app warn or fail; the app's
+  line says how many are exempt, and the report lists them with their reasons.
+- An exemption that covers nothing in its app's scan shows as *Unused exemption* (Info): the rule
+  passes now, or a name is spelled differently. One for an app that isn't in the folder is named in
+  the status bar after a full scan.
+- `"Enabled": false` keeps an entry in the file without effect.
+
+The built-in list is empty: exemptions are your decisions, so they live only in your JSON.
 
 ## The window
 
@@ -184,7 +230,7 @@ runtime it's running on.
 | Copy report | Copies every warning and failure across all apps as plain text, plus every license to review |
 | BACKUP all | Writes `yyyy-MM-dd-HH-mm-ss-REPO-SOURCE-BACKUP.zip` to Downloads, holding the newest snapshot of every app under its name without the version number (`EolInspector.zip`). Everything inside, each repo zip and every file in it, is dated the day you press the button at 00:00:00, so code from a backup is easy to tell apart. Private files are always included: it's your archive. The file name keeps the full time, so several backups on one day stay apart, and the backup file itself keeps its real time |
 | Collect README | Writes `yyyy-MM-dd-HH-mm-ss-REPO-READMES.zip` to Downloads, holding the readmes and license files from every app's newest snapshot, one folder per app, each file at its path inside the repo and dated today at 00:00:00. When an app has more than one readme, you tick which ones go in first; license files always go in |
-| Scan | Checks the folder |
+| Scan | Checks the folder. Every app is listed at once, greyed, and lights up as soon as its check is done; finished apps can be opened while the rest run. Apps are checked side by side on all cores but one, and the status bar says how long the scan took |
 
 **Per app**
 
@@ -205,7 +251,8 @@ runtime it's running on.
 - **Show in Explorer** opens the snapshot's folder.
 - **Fix.** Some findings on zip snapshots can be fixed: remove solution files, obsolete IDE
   files, git files or the unlisted files you tick, add the publish settings or a version, turn
-  off debug information, keep the commit out of the version, or set release timestamps. Queue the fixes, then press **Apply**. A
+  off debug information, keep the commit out of the version, add the MIT license, or set release
+  timestamps. Queue the fixes, then press **Apply**. A
   preview lists every change before anything is written. The fixed copy goes to Downloads,
   every file dated the release date at 00:00:00, and the history folder stays as it is. It keeps
   the private files: it goes through RepoBuilder before anything is published.
@@ -221,6 +268,8 @@ The gear in the header opens the standard. One card per setting: its name, its k
 |---|---|---|
 | Approved packages | `Standard.ApprovedPackages` | none: every third-party package fails until you approve it |
 | Private files | `Standard.PrivateFiles` | none |
+| License holder | `Standard.LicenseHolder` | none: the MIT license fix isn't offered until you set it |
+| Exemptions | `Standard.Exemptions` | none: every app is held to every rule |
 | Whitelist | `Standard.Whitelist` | `*.cs`, `*.xaml`, `*.csproj`, `*.slnx`, `app.ico`, `app.png`, `app.svg`, `app_*.png`, `app.manifest`, `Directory.Build.props` |
 | Web packages | `Standard.WebPackages` | `HtmlAgilityPack`, `Microsoft.Web.WebView2` |
 | Minimum target framework | `Standard.MinimumTargetFramework` | `net10.0-windows`; newer passes, same platform |

@@ -28,7 +28,8 @@ public enum FixKind
     RemoveUnlistedFiles,
     AddVersion,
     ReleaseTimestamps,
-    NoCommitInVersion
+    NoCommitInVersion,
+    AddMitLicense
 }
 
 /// <summary>Whether the app uses NuGet packages, and whether they're all on the approved list.</summary>
@@ -61,6 +62,8 @@ public sealed class ScanFacts
     public bool HasTests { get; set; }
     public PackageState Packages { get; set; }
     public List<PackageUse> PackageUses { get; } = new();
+    /// <summary>Findings each exemption covered, by the exemption's key.</summary>
+    public Dictionary<string, int> ExemptionUses { get; set; } = new();
     /// <summary>Every README.* in the snapshot, as snapshot-relative paths.</summary>
     public List<string> Readmes { get; } = new();
     /// <summary>Every LICENSE / LICENCE / COPYING file in the snapshot, snapshot-relative.</summary>
@@ -90,12 +93,17 @@ public sealed record CheckResult(string Category, string Rule, CheckStatus Statu
     /// <summary>The word on a License pill: MIT or license. Other statuses use their own word.</summary>
     public string? PillWord { get; init; }
 
+    /// <summary>Set when an exemption covers the finding: the reason. The row is then Info, with the word Exempt.</summary>
+    public string? ExemptReason { get; init; }
+
     public bool CanFix => Fix != FixKind.None;
     public FixTarget Target => new(Fix, FixProject);
-    public string StatusLabel => Status == CheckStatus.License ? StatusWord.ToUpperInvariant() : Status.ToString().ToUpperInvariant();
+    public string StatusLabel => Status == CheckStatus.License || ExemptReason is not null
+        ? StatusWord.ToUpperInvariant()
+        : Status.ToString().ToUpperInvariant();
 
     /// <summary>The word on the status pill.</summary>
-    public string StatusWord => Status switch
+    public string StatusWord => ExemptReason is not null ? "Exempt" : Status switch
     {
         CheckStatus.Pass => "Pass",
         CheckStatus.Info => "Info",
@@ -125,6 +133,8 @@ public sealed class AppAudit
     public bool HasTests { get; set; }
     public PackageState Packages { get; set; }
     public List<PackageUse> PackageUses { get; } = new();
+    /// <summary>Findings each exemption covered in this app, by the exemption's key. Memory only.</summary>
+    public Dictionary<string, int> ExemptionUses { get; } = new(StringComparer.Ordinal);
     /// <summary>Every README.* found in the snapshot at scan time, snapshot-relative.</summary>
     public List<string> Readmes { get; } = new();
     /// <summary>Every license file found in the snapshot at scan time, snapshot-relative.</summary>
@@ -143,6 +153,20 @@ public sealed class AppAudit
     /// <summary>The snapshot couldn't be read because it is still being written; it is checked again.</summary>
     public bool Pending { get; set; }
 
+    /// <summary>Listed while a scan runs but not checked yet. Replaced by the real result when its turn is done.</summary>
+    public bool Waiting { get; init; }
+
+    /// <summary>An app found by the scan, shown greyed in the list until it has been checked.</summary>
+    public static AppAudit Placeholder(AppCandidate candidate) => new()
+    {
+        AppName = candidate.AppName,
+        FolderPath = candidate.FolderPath,
+        SnapshotPath = candidate.LatestPath,
+        VersionText = candidate.VersionText,
+        SnapshotCount = candidate.SnapshotCount,
+        Waiting = true
+    };
+
     /// <summary>The newest snapshot's path, size and time when it was checked, to notice a newer one.</summary>
     public SnapshotFingerprint? Fingerprint { get; set; }
 
@@ -154,6 +178,7 @@ public sealed class AppAudit
     public int PassCount => Results.Count(r => r.Status == CheckStatus.Pass);
     public int InfoCount => Results.Count(r => r.Status == CheckStatus.Info);
     public int LicenseCount => Results.Count(r => r.Status == CheckStatus.License);
+    public int ExemptCount => Results.Count(r => r.ExemptReason is not null);
 
     /// <summary>Not on a standard MIT license: no license file, another license, or MIT that isn't standard.</summary>
     public bool NeedsLicenseReview => !Skipped && LicenseCount > 0 && !LicenseIsMit;
@@ -167,7 +192,7 @@ public sealed class AppAudit
     public bool IsZipSnapshot => SnapshotPath?.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) == true;
 
     public CheckStatus Overall =>
-        Skipped ? CheckStatus.Info
+        Waiting || Skipped ? CheckStatus.Info
         : FailCount > 0 ? CheckStatus.Fail
         : WarnCount > 0 ? CheckStatus.Warn
         : CheckStatus.Pass;
@@ -176,14 +201,16 @@ public sealed class AppAudit
     {
         get
         {
+            if (Waiting) return "Waiting to be checked";
             if (Skipped) return "No numbered snapshots";
             if (Pending) return $"{VersionText}, still being written";
-            if (FailCount + WarnCount == 0) return $"{VersionText}, all checks pass";
+            var exempt = ExemptCount > 0 ? $", {ExemptCount} exempt" : "";
+            if (FailCount + WarnCount == 0) return $"{VersionText}, all checks pass{exempt}";
 
             var parts = new List<string>();
             if (FailCount > 0) parts.Add($"{FailCount} failing");
             if (WarnCount > 0) parts.Add($"{WarnCount} warning{(WarnCount == 1 ? "" : "s")}");
-            return $"{VersionText}, {string.Join(", ", parts)}";
+            return $"{VersionText}, {string.Join(", ", parts)}{exempt}";
         }
     }
 }

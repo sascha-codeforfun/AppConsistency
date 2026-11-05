@@ -196,6 +196,16 @@
                 <ListBox.ItemTemplate>
                     <DataTemplate>
                         <Grid>
+                            <!-- Greyed while the scan hasn't reached this app yet; lit once its result is in. -->
+                            <Grid.Style>
+                                <Style TargetType="Grid">
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding Waiting}" Value="True">
+                                            <Setter Property="Opacity" Value="0.4" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Grid.Style>
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="Auto" />
                                 <ColumnDefinition Width="*" />

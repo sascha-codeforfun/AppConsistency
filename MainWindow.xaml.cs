@@ -133,30 +133,58 @@ public partial class MainWindow : Window
                 return;
             }
 
-            for (int i = 0; i < candidates.Count; i++)
+            // Every app is listed at once, greyed, and lights up when its check is done. The checks
+            // run side by side on all cores but one, so the window keeps a core to itself.
+            var clock = Stopwatch.StartNew();
+            foreach (var candidate in candidates) _apps.Add(AppAudit.Placeholder(candidate));
+            EmptyText.Text = "Select an app to see its findings once it has been checked.";
+            SetStatus($"Checking {candidates.Count} app{(candidates.Count == 1 ? "" : "s")}…", "Brush.Accent");
+
+            var placeholders = _apps.ToList();
+            var gate = new SemaphoreSlim(Math.Max(1, Environment.ProcessorCount - 1));
+            var checks = candidates.Select(async (candidate, index) =>
             {
-                var candidate = candidates[i];
-                SetStatus($"Checking {candidate.AppName} ({i + 1} of {candidates.Count})…", "Brush.Accent");
-                _apps.Add(await Task.Run(() => Auditor.Audit(candidate)));
+                await gate.WaitAsync().ConfigureAwait(false);
+                try { return (Index: index, Audit: await Task.Run(() => Auditor.Audit(candidate)).ConfigureAwait(false)); }
+                finally { gate.Release(); }
+            }).ToList();
+
+            int done = 0;
+            await foreach (var check in Task.WhenEach(checks))
+            {
+                var (index, audit) = await check;
+                var placeholder = placeholders[index];
+                bool selected = ReferenceEquals(AppList.SelectedItem, placeholder);
+                _apps[_apps.IndexOf(placeholder)] = audit;
+                if (selected) AppList.SelectedItem = audit;
+                done++;
+                SetStatus($"Checking {candidates.Count} app{(candidates.Count == 1 ? "" : "s")}… {done} done.", "Brush.Accent");
             }
+            clock.Stop();
+            EmptyText.Text = "Select an app to see its findings.";
 
             _scannedRoot = root;
             _singleApp = candidates.Count == 1 && SamePath(candidates[0].FolderPath, root);
 
-            var first = _apps.FirstOrDefault(a => a.Overall == CheckStatus.Fail)
-                        ?? _apps.FirstOrDefault(a => a.Overall == CheckStatus.Warn)
-                        ?? _apps[0];
-            AppList.SelectedItem = first;
-            AppList.ScrollIntoView(first);
+            // Leave a choice made during the scan alone; otherwise start at the first app that needs attention.
+            if (AppList.SelectedItem is null)
+            {
+                var first = _apps.FirstOrDefault(a => a.Overall == CheckStatus.Fail)
+                            ?? _apps.FirstOrDefault(a => a.Overall == CheckStatus.Warn)
+                            ?? _apps[0];
+                AppList.SelectedItem = first;
+                AppList.ScrollIntoView(first);
+            }
 
             StartWatching(root, _singleApp);
-            SetStatus(SummaryLine() + (_watcher?.IsWatching == false
+            SetStatus(SummaryLine() + $" Took {Seconds(clock.Elapsed)}." + (_watcher?.IsWatching == false
                 ? " This folder can't be watched, so it's checked for newer snapshots every 30 seconds."
                 : ""), "Brush.Ok");
             UpdateSummaryPills();
         }
         catch (Exception ex)
         {
+            foreach (var waiting in _apps.Where(a => a.Waiting).ToList()) _apps.Remove(waiting);
             EmptyText.Text = "The scan stopped with an error.";
             SetStatus("Scan failed: " + ex.Message, "Brush.Error");
         }
@@ -165,6 +193,12 @@ public partial class MainWindow : Window
             SetBusy(false);
         }
     }
+
+    /// <summary>A scan's duration for the status line: "0.6 s", "12 s", "1 min 5 s".</summary>
+    private static string Seconds(TimeSpan time) =>
+        time.TotalSeconds < 10 ? time.TotalSeconds.ToString("0.0", CultureInfo.CurrentCulture) + " s"
+        : time.TotalMinutes < 1 ? $"{time.TotalSeconds:0} s"
+        : $"{(int)time.TotalMinutes} min {time.Seconds} s";
 
     /// <summary>The status bar: a line of text and a dot whose colour is a theme brush key.</summary>
     private void SetStatus(string text, string dotKey = "Brush.Stale")
@@ -306,7 +340,17 @@ public partial class MainWindow : Window
         var text = $"Checked {_apps.Count} app{(_apps.Count == 1 ? "" : "s")}: {pass} passed, {warn} warned, {fail} failed";
         if (skipped > 0) text += $", {skipped} without snapshots";
         if (license > 0) text += $"; {license} with a license to review";
-        return text + ".";
+        text += ".";
+
+        // An exemption for an app that isn't in the folder can't be reported by any app's scan. Only on a
+        // scan of the whole folder: one app on its own says nothing about the others.
+        var scanned = _apps.Where(a => !a.Skipped).Select(a => a.AppName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var strays = _apps.Count > 1
+            ? Standard.Current.Exemptions.Select(e => e.App).Distinct(StringComparer.OrdinalIgnoreCase).Where(a => !scanned.Contains(a)).ToList()
+            : [];
+        if (strays.Count > 0)
+            text += $" Exemptions name {(strays.Count == 1 ? "an app" : "apps")} not in the folder: {string.Join(", ", strays)}.";
+        return text;
     }
 
     // ---------- Watching for newer snapshots ----------
@@ -574,8 +618,9 @@ public partial class MainWindow : Window
         _current = audit;
         ClearNotice();
 
-        if (audit is null)
+        if (audit is null || audit.Waiting)
         {
+            if (audit is not null) EmptyText.Text = $"{audit.AppName} is waiting to be checked.";
             DetailPanel.Visibility = Visibility.Collapsed;
             EmptyText.Visibility = Visibility.Visible;
             return;

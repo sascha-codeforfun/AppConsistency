@@ -34,6 +34,60 @@ public sealed class NameEntry
     public NameEntry Clone() => new() { Name = Name, Enabled = Enabled };
 }
 
+/// <summary>
+/// One app allowed to break one rule, with the reason. File, Method and Origin narrow it: each one
+/// given has to match. Switched off, it stays in the file without effect.
+/// </summary>
+public sealed class ExemptionEntry
+{
+    public string Rule { get; set; } = "";
+    public string App { get; set; } = "";
+
+    /// <summary>The end of a file's path, e.g. Services/ConsolePreset.cs.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? File { get; set; }
+
+    /// <summary>The method a write sits in (write checks only).</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Method { get; set; }
+
+    /// <summary>Where a write points, e.g. ApplicationData (write checks only).</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Origin { get; set; }
+
+    public string Reason { get; set; } = "";
+
+    [JsonIgnore] public bool Enabled { get; set; } = true;
+
+    /// <summary>In the file only when switched off: "Enabled": false.</summary>
+    [JsonPropertyName("Enabled"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? EnabledInFile
+    {
+        get => Enabled ? null : false;
+        set => Enabled = value ?? true;
+    }
+
+    /// <summary>What the entry matches, without the reason: the same key means the same exemption.</summary>
+    [JsonIgnore]
+    public string Key => string.Join("|", new[] { App, Rule, File, Method, Origin }.Select(v => (v ?? "").Trim().ToLowerInvariant()));
+
+    /// <summary>"No AppData for EremitVM, in Services/ConsolePreset.cs, method Ensure, origin ApplicationData".</summary>
+    [JsonIgnore]
+    public string Describe
+    {
+        get
+        {
+            var parts = new List<string> { $"{Rule} for {App}" };
+            if (!string.IsNullOrWhiteSpace(File)) parts.Add($"in {File}");
+            if (!string.IsNullOrWhiteSpace(Method)) parts.Add($"method {Method}");
+            if (!string.IsNullOrWhiteSpace(Origin)) parts.Add($"origin {Origin}");
+            return string.Join(", ", parts);
+        }
+    }
+
+    public ExemptionEntry Clone() => new()
+    {
+        Rule = Rule, App = App, File = File, Method = Method, Origin = Origin, Reason = Reason, Enabled = Enabled
+    };
+}
+
 public sealed class IconSettings
 {
     public string ExeIcon { get; set; } = "";
@@ -73,11 +127,14 @@ public sealed class StandardFile
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public IconSettings? Icon { get; set; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public PublishSettings? Publish { get; set; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public ReleaseSettings? Release { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? LicenseHolder { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<ExemptionEntry>? Exemptions { get; set; }
 
     [JsonIgnore]
     public bool IsEmpty =>
         ApprovedPackages is null && PrivateFiles is null && Whitelist is null && WebPackages is null
-        && MinimumTargetFramework is null && Icon is null && Publish is null && Release is null;
+        && MinimumTargetFramework is null && Icon is null && Publish is null && Release is null
+        && LicenseHolder is null && Exemptions is null;
 }
 
 /// <summary>
@@ -90,6 +147,7 @@ public sealed class Standard
 
     public static IReadOnlyList<PackageEntry> DefaultApprovedPackages { get; } = [];
     public static IReadOnlyList<NameEntry> DefaultPrivateFiles { get; } = [];
+    public static IReadOnlyList<ExemptionEntry> DefaultExemptions { get; } = [];
 
     public static IReadOnlyList<NameEntry> DefaultWhitelist { get; } = Names(
         "*.cs", "*.xaml", "*.csproj", "*.slnx", "app.ico", "app.png", "app.svg", "app_*.png", "app.manifest", "Directory.Build.props");
@@ -97,6 +155,9 @@ public sealed class Standard
     public static IReadOnlyList<NameEntry> DefaultWebPackages { get; } = Names("HtmlAgilityPack", "Microsoft.Web.WebView2");
 
     public const string DefaultMinimumTargetFramework = "net10.0-windows";
+
+    /// <summary>No license holder by default: the MIT fix needs your name, and the public code has none.</summary>
+    public const string DefaultLicenseHolder = "";
 
     public static IconSettings DefaultIcon => new() { ExeIcon = "app.ico", HeaderImage = "app_256.png", HeaderImageSize = 256 };
 
@@ -134,6 +195,12 @@ public sealed class Standard
     public IconSettings Icon { get; private init; } = DefaultIcon;
     public PublishSettings Publish { get; private init; } = DefaultPublish;
     public ReleaseSettings Release { get; private init; } = DefaultRelease;
+
+    /// <summary>The name the MIT fix writes into the copyright line; empty means the fix isn't offered.</summary>
+    public string LicenseHolder { get; private init; } = DefaultLicenseHolder;
+
+    /// <summary>Active exemptions with a rule, an app and a reason; optional parts trimmed, blank ones null.</summary>
+    public IReadOnlyList<ExemptionEntry> Exemptions { get; private init; } = [];
 
     private IReadOnlyList<Regex> _whitelistPatterns = [];
 
@@ -187,7 +254,19 @@ public sealed class Standard
                 PublishSuffix = SafeName(release.PublishSuffix, DefaultRelease.PublishSuffix),
                 BackupName = SafeName(release.BackupName, DefaultRelease.BackupName),
                 ReadmeCollectionName = SafeName(release.ReadmeCollectionName, DefaultRelease.ReadmeCollectionName)
-            }
+            },
+            LicenseHolder = Collapse(file?.LicenseHolder),
+            Exemptions = (file?.Exemptions ?? DefaultExemptions)
+                .Where(e => e.Enabled && !string.IsNullOrWhiteSpace(e.Rule) && !string.IsNullOrWhiteSpace(e.App)
+                            && !string.IsNullOrWhiteSpace(e.Reason))
+                .Select(e => new ExemptionEntry
+                {
+                    Rule = e.Rule.Trim(), App = e.App.Trim(), Reason = Collapse(e.Reason),
+                    File = Blank(e.File), Method = Blank(e.Method), Origin = Blank(e.Origin)
+                })
+                .GroupBy(e => e.Key)
+                .Select(g => g.First())
+                .ToList()
         };
     }
 
@@ -230,6 +309,11 @@ public sealed class Standard
 
     private static List<string> Enabled(IEnumerable<NameEntry> entries) =>
         entries.Where(e => e.Enabled && e.Name.Trim().Length > 0).Select(e => e.Name.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+    private static string? Blank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+
+    private static string Collapse(string? value) =>
+        string.Join(' ', (value ?? "").Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
 
     private static string Or(string? value, string fallback) => string.IsNullOrWhiteSpace(value) ? fallback : value.Trim();
 

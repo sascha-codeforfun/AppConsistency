@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using CSharpLexing;
 
 namespace AppConsistency.Core;
 
@@ -14,7 +15,8 @@ public enum WriteTarget
 }
 
 /// <param name="Standard">A write next to the exe that is the app's own AssemblyName.json, your settings standard.</param>
-public sealed record WriteSite(string File, int Line, string Call, WriteTarget Target, string Via, bool Standard);
+/// <param name="Method">The method the write sits in, or null when it can't be told.</param>
+public sealed record WriteSite(string File, int Line, string Call, WriteTarget Target, string Via, bool Standard, string? Method = null);
 
 /// <summary>
 /// Reads the code for writes to fixed places: AppData, the temp folder and the exe's own folder.
@@ -22,15 +24,12 @@ public sealed record WriteSite(string File, int Line, string Call, WriteTarget T
 /// through the variables, fields, properties and methods it is built from, until it reaches where
 /// the folder comes from. A path the user picks (a dialog) or one passed in from elsewhere doesn't
 /// lead to a fixed place, so it isn't reported. This reads the source, it doesn't run anything:
-/// a path assembled in ways it can't follow is missed, never guessed.
+/// a path assembled in ways it can't follow is missed, never guessed. Paths built with string
+/// interpolation are followed through their holes. Calls, definitions and the brackets that
+/// delimit them are only counted where they are code, never inside a string or a comment.
 /// </summary>
 public static class WriteScan
 {
-    // Strings, chars and comments, the same pattern CodeHeaderScan uses; only comments are blanked here.
-    private static readonly Regex Noise = new(
-        @"@""(?:""""|[^""])*""|\$?@?""(?:\\.|[^""\\\n])*""|'(?:\\.|[^'\\\n])+'|//[^\n]*|/\*.*?\*/",
-        RegexOptions.Singleline | RegexOptions.Compiled);
-
     // Calls that write a file or create a folder. "arg" is the index of the destination argument.
     private static readonly (Regex Pattern, int Arg, string Name)[] WriteCalls =
     [
@@ -66,7 +65,6 @@ public static class WriteScan
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private static readonly Regex Identifier = new(@"(?<![\w.""])(?:\w+\.)*(?<name>[A-Za-z_]\w*)(?<call>\s*\()?", RegexOptions.Compiled);
-    private static readonly Regex StringLiteral = new(@"""(?:\\.|[^""\\\n])*""", RegexOptions.Compiled);
 
     private static readonly HashSet<string> NotData = new(StringComparer.Ordinal)
     {
@@ -78,26 +76,36 @@ public static class WriteScan
 
     private const int MaxDepth = 8;
 
+    /// <summary>
+    /// A source file twice over, at identical positions: Text with comments blanked, where paths and
+    /// file names are read; Masked with strings blanked as well, where calls, definitions and
+    /// brackets are found.
+    /// </summary>
+    private sealed record Source(SnapshotFile File, string Text, string Masked);
+
     public static List<WriteSite> Scan(IReadOnlyList<SnapshotFile> files, string assemblyName)
     {
         var code = files
             .Where(f => f.Extension == ".cs" && f.Text is not null)
-            .Select(f => (File: f, Text: BlankComments(f.Text!)))
+            .Select(f => new Source(f, CSharpLexer.BlankComments(f.Text!), CSharpLexer.BlankCommentsAndStrings(f.Text!)))
             .ToList();
 
+        var lookups = new Lookups(code);
         var sites = new List<WriteSite>();
-        foreach (var (file, text) in code)
+        foreach (var source in code)
         {
+            var (file, text, masked) = source;
             foreach (var (pattern, argIndex, name) in WriteCalls)
             {
-                foreach (Match call in pattern.Matches(text))
+                // Found in the masked text: a call written inside a string isn't a call.
+                foreach (Match call in pattern.Matches(masked))
                 {
-                    var args = Arguments(text, call.Index + call.Length);
+                    var args = Arguments(source, call.Index + call.Length);
                     if (args.Count <= argIndex) continue;
                     if (name == "new FileStream" && !WritesStream(args)) continue;
                     if (name == "ZipFile.Open" && !(args.Count > 1 && Regex.IsMatch(args[1], @"\b(?:Create|Update)\b"))) continue;
 
-                    var found = new Trace(code);
+                    var found = new Trace(lookups);
                     found.Follow(args[argIndex], file, call.Index, 0);
                     var target = found.AppData ? WriteTarget.AppData : found.Temp ? WriteTarget.Temp : found.Exe ? WriteTarget.ExeFolder : (WriteTarget?)null;
                     if (target is null) continue;
@@ -105,7 +113,8 @@ public static class WriteScan
                     int line = text.AsSpan(0, call.Index).Count('\n') + 1;
                     var via = found.AppData ? found.AppDataVia : found.Temp ? "temp folder" : "next to the exe";
                     bool standard = target == WriteTarget.ExeFolder && found.IsOwnJson(assemblyName);
-                    sites.Add(new WriteSite(file.RelPath, line, CallName(text, call), target.Value, via, standard));
+                    var method = MethodLocator.Enclosing(masked, call.Index);
+                    sites.Add(new WriteSite(file.RelPath, line, CallName(text, call), target.Value, via, standard, method));
                 }
             }
         }
@@ -118,8 +127,75 @@ public static class WriteScan
             .ToList();
     }
 
+    /// <summary>
+    /// Where names are defined, found once per scan and shared by every trace in it. Each write call
+    /// starts its own trace, and they mostly follow the same names; without this, every one of them
+    /// built the same patterns again and ran them over all the code again.
+    /// </summary>
+    private sealed class Lookups(List<Source> code)
+    {
+        private readonly Dictionary<(string Name, bool IsCall), List<(string Expression, SnapshotFile File, int Position)>> _members = new();
+        private readonly Dictionary<(string Name, SnapshotFile File), List<(int Index, int End, string Expression)>> _locals = new();
+
+        public Source SourceOf(SnapshotFile file) => code.First(c => c.File == file);
+
+        /// <summary>
+        /// The assignments to a local in one file, in order. A match lies wholly before a position
+        /// exactly when it would have been found in the text cut off there: "[^;]+;" can't reach past
+        /// the cut, so the matches before it are the same either way.
+        /// </summary>
+        public List<(int Index, int End, string Expression)> Locals(string name, SnapshotFile file)
+        {
+            if (_locals.TryGetValue((name, file), out var found)) return found;
+
+            var source = SourceOf(file);
+            var local = new Regex($@"\b{Regex.Escape(name)}\s*=(?![=>])(?<rhs>[^;]+);");
+            found = local.Matches(source.Masked)
+                .Select(m => (m.Index, m.Index + m.Length, Read(source, m.Groups["rhs"])))
+                .ToList();
+            _locals[(name, file)] = found;
+            return found;
+        }
+
+        /// <summary>A field, property or method across the code: what it's set to, or everything it returns.</summary>
+        public List<(string Expression, SnapshotFile File, int Position)> Members(string name, bool isCall)
+        {
+            if (_members.TryGetValue((name, isCall), out var found)) return found;
+
+            var n = Regex.Escape(name);
+            var member = isCall
+                ? new Regex($@"\b{n}\s*\([^;{{)]*\)\s*(?:=>(?<rhs>[^;]+);|\{{)", RegexOptions.Singleline)
+                : new Regex($@"\b{n}\s*(?:\{{\s*get;[^}}]*\}}\s*=|=>|=(?![=>]))(?<rhs>[^;]+);");
+
+            found = new List<(string, SnapshotFile, int)>();
+            foreach (var source in code)
+            {
+                var other = source.File;
+                foreach (Match m in member.Matches(source.Masked))
+                {
+                    if (m.Groups["rhs"].Success)
+                    {
+                        found.Add((Read(source, m.Groups["rhs"]), other, m.Index));
+                        continue;
+                    }
+
+                    // A method with a body: everything it returns.
+                    int end = MatchingBrace(source.Masked, m.Index + m.Length - 1);
+                    if (end < 0) continue;
+                    int bodyStart = m.Index + m.Length;
+                    foreach (Match r in ReturnValue.Matches(source.Masked[bodyStart..end]))
+                        found.Add((Read(source, r.Groups["rhs"], bodyStart), other, bodyStart + r.Index));
+                }
+            }
+            _members[(name, isCall)] = found;
+            return found;
+        }
+    }
+
+    private static readonly Regex ReturnValue = new(@"\breturn\b(?<rhs>[^;]+);", RegexOptions.Compiled);
+
     /// <summary>Follows a path expression back to where its folder comes from.</summary>
-    private sealed class Trace(List<(SnapshotFile File, string Text)> code)
+    private sealed class Trace(Lookups lookups)
     {
         private readonly HashSet<string> _seen = new(StringComparer.Ordinal);
         private readonly List<string> _literals = new();
@@ -147,11 +223,14 @@ public static class WriteScan
             if (TempSource.IsMatch(expression)) Temp = true;
             if (ExeSource.IsMatch(expression)) Exe = true;
             if (ExeNameJson.IsMatch(expression)) _ownNameJson = true;
-            foreach (Match s in StringLiteral.Matches(expression))
-                _literals.Add(s.Value.Trim('"').Split('\\', '/')[^1]);
+            // File names from the literals, every kind. A hole ends a path segment, so
+            // $"{AppContext.BaseDirectory}App.json" names App.json, and a name built in a hole matches nothing.
+            foreach (var literal in CSharpLexer.Literals(expression))
+                _literals.Add(literal.Text(expression, "/").Split('\\', '/')[^1]);
 
-            var withoutStrings = StringLiteral.Replace(expression, "\"\"");
-            foreach (Match id in Identifier.Matches(withoutStrings))
+            // Names from the code only, which includes the holes of interpolated strings: $"{folder}\\x.json" follows folder.
+            var codeOnly = CSharpLexer.BlankCommentsAndStrings(expression);
+            foreach (Match id in Identifier.Matches(codeOnly))
             {
                 var name = id.Groups["name"].Value;
                 if (NotData.Contains(name) || !_seen.Add(name)) continue;
@@ -164,45 +243,27 @@ public static class WriteScan
         /// <summary>
         /// What a name stands for. A local (lower-case) is looked for before its use in the same file,
         /// nearest first. A member (field, property, method) is looked for across the code.
+        /// Definitions are matched in the masked text, so one written inside a string doesn't count and
+        /// a semicolon inside a string doesn't end one; the expression is then read from the text at
+        /// the same position.
         /// </summary>
         private IEnumerable<(string Expression, SnapshotFile File, int Position)> Definitions(
             string name, bool isCall, SnapshotFile file, int position)
         {
-            var n = Regex.Escape(name);
-
             if (!isCall && char.IsLower(name[0]))
             {
-                var text = code.First(c => c.File == file).Text;
-                var local = new Regex($@"\b{n}\s*=(?![=>])\s*(?<rhs>[^;]+);");
-                var nearest = local.Matches(text[..Math.Min(position, text.Length)]).LastOrDefault();
-                if (nearest is not null) yield return (nearest.Groups["rhs"].Value, file, nearest.Index);
-                yield break;
+                // The nearest assignment that ends before the use.
+                var nearest = lookups.Locals(name, file).LastOrDefault(l => l.End <= position);
+                return nearest.Expression is null ? [] : [(nearest.Expression, file, nearest.Index)];
             }
 
-            var member = isCall
-                ? new Regex($@"\b{n}\s*\([^;{{)]*\)\s*(?:=>\s*(?<rhs>[^;]+);|\{{)", RegexOptions.Singleline)
-                : new Regex($@"\b{n}\s*(?:\{{\s*get;[^}}]*\}}\s*=|=>|=(?![=>]))\s*(?<rhs>[^;]+);");
-
-            foreach (var (other, text) in code)
-            {
-                foreach (Match m in member.Matches(text))
-                {
-                    if (m.Groups["rhs"].Success)
-                    {
-                        yield return (m.Groups["rhs"].Value, other, m.Index);
-                        continue;
-                    }
-
-                    // A method with a body: everything it returns.
-                    int end = MatchingBrace(text, m.Index + m.Length - 1);
-                    if (end < 0) continue;
-                    var body = text[(m.Index + m.Length)..end];
-                    foreach (Match r in Regex.Matches(body, @"\breturn\s+(?<rhs>[^;]+);"))
-                        yield return (r.Groups["rhs"].Value, other, m.Index + m.Length + r.Index);
-                }
-            }
+            return lookups.Members(name, isCall);
         }
     }
+
+    /// <summary>The text at a group found in the masked copy: the same span, with its strings in place.</summary>
+    private static string Read(Source source, Group group, int offset = 0) =>
+        source.Text.Substring(offset + group.Index, group.Length).Trim();
 
     /// <summary>A FileStream that writes: a mode or access that creates, appends or writes.</summary>
     private static bool WritesStream(List<string> args) =>
@@ -221,26 +282,19 @@ public static class WriteScan
         return Regex.Replace(raw, @"\s+", " ");
     }
 
-    /// <summary>The top-level arguments of a call, from just after its opening parenthesis.</summary>
-    private static List<string> Arguments(string text, int start)
+    /// <summary>
+    /// The top-level arguments of a call, from just after its opening parenthesis. Brackets, commas
+    /// and semicolons are counted in the masked text, where strings, chars and comments are blank;
+    /// the arguments are read from the text at the same positions.
+    /// </summary>
+    private static List<string> Arguments(Source source, int start)
     {
+        var (_, text, masked) = source;
         var args = new List<string>();
         int depth = 0, from = start;
-        for (int i = start; i < text.Length && i < start + 4000; i++)
+        for (int i = start; i < masked.Length && i < start + 4000; i++)
         {
-            char c = text[i];
-            if (c == '"')
-            {
-                // Skip a string literal, including verbatim ones.
-                bool verbatim = i > 0 && text[i - 1] == '@';
-                for (i++; i < text.Length; i++)
-                {
-                    if (verbatim && text[i] == '"' && i + 1 < text.Length && text[i + 1] == '"') { i++; continue; }
-                    if (!verbatim && text[i] == '\\') { i++; continue; }
-                    if (text[i] == '"') break;
-                }
-                continue;
-            }
+            char c = masked[i];
             if (c is '(' or '[' or '{') depth++;
             else if (c is ')' or ']' or '}')
             {
@@ -261,6 +315,7 @@ public static class WriteScan
         return args;
     }
 
+    /// <summary>The closing brace for an opening one, counted in masked text so braces in strings and chars don't count.</summary>
     private static int MatchingBrace(string text, int open)
     {
         int depth = 0;
@@ -271,16 +326,4 @@ public static class WriteScan
         }
         return -1;
     }
-
-    /// <summary>Blanks comments, keeping strings, length and line breaks.</summary>
-    private static string BlankComments(string code) =>
-        Noise.Replace(code, m =>
-        {
-            if (!m.Value.StartsWith("//", StringComparison.Ordinal) && !m.Value.StartsWith("/*", StringComparison.Ordinal))
-                return m.Value;
-            var chars = m.Value.ToCharArray();
-            for (int i = 0; i < chars.Length; i++)
-                if (chars[i] is not ('\r' or '\n')) chars[i] = ' ';
-            return new string(chars);
-        });
 }

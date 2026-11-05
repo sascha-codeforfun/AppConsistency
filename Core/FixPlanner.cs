@@ -21,6 +21,9 @@ public sealed class FixPlan
     /// <summary>Edited project files: relative path → new bytes.</summary>
     public Dictionary<string, byte[]> EditedFiles { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>New files: zip entry name → bytes.</summary>
+    public Dictionary<string, byte[]> AddedFiles { get; } = new(StringComparer.Ordinal);
+
     /// <summary>The release-timestamps fix was queued: it counts as a change on its own.</summary>
     public bool Retime { get; set; }
 
@@ -30,7 +33,7 @@ public sealed class FixPlan
     /// <summary>Queued fixes that turned out not to apply, with the reason.</summary>
     public List<string> Skipped { get; } = new();
 
-    public bool HasChanges => RemoveEntries.Count > 0 || RemoveFolders.Count > 0 || EditedFiles.Count > 0 || Retime;
+    public bool HasChanges => RemoveEntries.Count > 0 || RemoveFolders.Count > 0 || EditedFiles.Count > 0 || AddedFiles.Count > 0 || Retime;
 
     /// <summary>Number of separate changes, for the summary message.</summary>
     public int ChangeCount { get; set; }
@@ -41,6 +44,7 @@ public sealed class FixPlan
         foreach (var rel in RemoveEntries) changes.RemoveFiles.Add(rel);
         changes.RemoveFolders.AddRange(RemoveFolders);
         foreach (var (rel, bytes) in EditedFiles) changes.Replace[rel] = bytes;
+        foreach (var (name, bytes) in AddedFiles) changes.Add[name] = bytes;
         return changes;
     }
 }
@@ -104,6 +108,10 @@ public static class FixPlanner
                     plan.Retime = true;
                     break;
 
+                case FixKind.AddMitLicense:
+                    PlanMitLicense(plan, snapshot, day);
+                    break;
+
                 case FixKind.NoCommitInVersion:
                     var revisionProject = apps.FirstOrDefault(a => a.RelPath.Equals(fix.Project, StringComparison.OrdinalIgnoreCase));
                     if (revisionProject is null) plan.Skipped.Add($"Commit in the version: {fix.Project} isn't in the snapshot.");
@@ -122,7 +130,7 @@ public static class FixPlanner
         plan.Sections.Add(("Release timestamps",
             [$"{(plan.Retime ? "~ " : "")}every entry dated {day:yyyy-MM-dd} 00:00:00, in sorted order, without NTFS or extended timestamps"]));
 
-        plan.ChangeCount = plan.RemoveEntries.Count + plan.RemoveFolders.Count + (plan.Retime ? 1 : 0)
+        plan.ChangeCount = plan.RemoveEntries.Count + plan.RemoveFolders.Count + plan.AddedFiles.Count + (plan.Retime ? 1 : 0)
                            + edits.Values.Sum(e => e.Lines.Count(l => !l.StartsWith("  ", StringComparison.Ordinal)));
         return plan;
     }
@@ -284,6 +292,29 @@ public static class FixPlanner
         var lines = outcome.Line.Split('\n');
         edit.Lines.Add("+ " + lines[0]);
         edit.Lines.AddRange(lines.Skip(1).Select(l => "  " + l));
+    }
+
+    /// <summary>
+    /// Adds the standard MIT license as LICENSE.txt in the wrapper folder, with the release date's year
+    /// and the license holder from the settings. Only when the snapshot has no license file at all.
+    /// </summary>
+    private static void PlanMitLicense(FixPlan plan, RepoSnapshot snapshot, DateTime day)
+    {
+        var holder = Standard.Current.LicenseHolder;
+        var existing = LicenseCheck.Find(snapshot);
+
+        if (existing.Count > 0)
+            plan.Skipped.Add($"MIT license: the snapshot already has {string.Join(", ", existing)}, which the Fix never replaces.");
+        else if (!LicenseCheck.IsFullName(holder))
+            plan.Skipped.Add("MIT license: set the license holder in Settings to a full name first.");
+        else if (snapshot.WrapperFolder is not { } wrapper)
+            plan.Skipped.Add("MIT license: the zip has no single wrapper folder to put it in.");
+        else
+        {
+            var name = $"{wrapper}/{FixCatalog.LicenseFileName}";
+            plan.AddedFiles[name] = new UTF8Encoding(false).GetBytes(LicenseCheck.StandardText(day.Year, holder));
+            plan.Sections.Add(("Add the MIT license", [$"+ {name} (MIT, {day.Year} {holder})"]));
+        }
     }
 
     /// <summary>

@@ -29,7 +29,8 @@ public static class Auditor
         try
         {
             var snapshot = RepoSnapshot.Load(candidate.LatestPath, candidate.LatestIsZip);
-            audit.Results.AddRange(StandardsRules.Run(snapshot, out var facts));
+            audit.Results.AddRange(StandardsRules.Run(snapshot, out var facts, candidate.AppName));
+            foreach (var (key, count) in facts.ExemptionUses) audit.ExemptionUses[key] = count;
             audit.HasTests = facts.HasTests;
             audit.Packages = facts.Packages;
             audit.PackageUses.AddRange(facts.PackageUses);

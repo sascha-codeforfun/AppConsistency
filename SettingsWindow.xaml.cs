@@ -47,6 +47,19 @@ public partial class SettingsWindow : Window
             Standard.DefaultPrivateFiles, file?.PrivateFiles, NameKind.FileName, "File name, e.g. NOTES.md",
             (f, list) => f.PrivateFiles = list));
 
+        Add(new ExemptionListCard(this, file?.Exemptions));
+
+        Add(new FieldsCard(this, "License holder", "Standard.LicenseHolder",
+            "The name the MIT license fix writes into the copyright line, with the release date's year. " +
+            "None by default, so the fix isn't offered until you set it: two or more words, as on the license.",
+            [new Field("Name", Standard.DefaultLicenseHolder, file?.LicenseHolder,
+                v => v.Length == 0 ? "Enter the license holder's name, or lock the setting."
+                   : LicenseCheck.IsFullName(v) ? null
+                   : $"The license holder \"{v}\" isn't a full name of two or more words.")],
+            (f, v) => f.LicenseHolder = v[0],
+            v => v[0].Trim().Length == 0 ? "The Fix writes: Copyright (c) <year> <name>"
+                                         : $"The Fix writes: Copyright (c) {DateTime.Today.Year} {v[0].Trim()}"));
+
         Add(new NameListCard(this, "Whitelist", "Standard.Whitelist",
             "Files every repo may hold. Anything else the build doesn't use is reported as unlisted. " +
             "A pattern matches a file name (*.cs, app_*.png); with a slash, the end of a path.",
@@ -508,6 +521,156 @@ public partial class SettingsWindow : Window
         private static bool IsVersion(string v) => Regex.IsMatch(v, @"^\d+(\.\d+){0,3}$");
     }
 
+    /// <summary>Apps allowed to break a rule, each with its reason. Identity can't be edited in place: remove and add.</summary>
+    private sealed class ExemptionListCard : Card
+    {
+        private List<ExemptionEntry> _entries;
+        private string? _error;
+
+        public ExemptionListCard(SettingsWindow window, List<ExemptionEntry>? fromFile)
+            : base(window, "Exemptions", "Standard.Exemptions",
+                "An app allowed to break one rule, with the reason. A finding it covers shows as Exempt, with the reason, and " +
+                "no longer makes the app warn or fail. File (the end of a path), Method and Origin narrow it; Method and Origin " +
+                "apply to the write checks. One that covers nothing is reported, so the list doesn't keep stale entries.",
+                "none", fromFile is not null)
+        {
+            _entries = (fromFile ?? Standard.DefaultExemptions.ToList()).Select(e => e.Clone()).ToList();
+        }
+
+        protected override void ResetToDefault() => _entries = Standard.DefaultExemptions.Select(e => e.Clone()).ToList();
+
+        public override void Write(StandardFile file) => file.Exemptions = _entries.Select(e => e.Clone()).ToList();
+
+        public override IEnumerable<string> Validate()
+        {
+            foreach (var e in _entries.Where(e => e.Reason.Trim().Length == 0))
+                yield return $"The exemption {e.Describe} needs a reason.";
+        }
+
+        public override void Render()
+        {
+            Body.Children.Clear();
+            if (_entries.Count == 0)
+                Body.Children.Add(Note("No exemptions: every app is held to every rule."));
+
+            foreach (var entry in _entries.OrderBy(e => e.App, StringComparer.OrdinalIgnoreCase).ThenBy(e => e.Rule, StringComparer.OrdinalIgnoreCase))
+            {
+                var left = new StackPanel();
+                var name = Text($"{entry.App} · {entry.Rule}", "Text.Mono");
+                name.FontSize = 13;
+                name.SetResourceReference(TextBlock.ForegroundProperty, "Brush.Text");
+                left.Children.Add(name);
+
+                var scope = new[]
+                {
+                    entry.File is { Length: > 0 } f ? $"file {f}" : null,
+                    entry.Method is { Length: > 0 } m ? $"method {m}" : null,
+                    entry.Origin is { Length: > 0 } o ? $"origin {o}" : null
+                }.Where(s => s is not null).ToList();
+                if (scope.Count > 0)
+                {
+                    var where = Text(string.Join(" · ", scope), "Text.Caption", wrap: true);
+                    where.Margin = new Thickness(0, 3, 0, 0);
+                    left.Children.Add(where);
+                }
+
+                if (Unlocked)
+                {
+                    var reason = new TextBox { Text = entry.Reason, Margin = new Thickness(0, 8, 0, 0), ToolTip = "Why the rule doesn't apply here" };
+                    reason.TextChanged += (_, _) => entry.Reason = reason.Text.Trim();
+                    AutomationProperties.SetName(reason, $"Reason for {entry.Describe}");
+                    left.Children.Add(reason);
+                }
+                else
+                {
+                    var reason = Text(entry.Reason, "Text.Body", wrap: true);
+                    reason.Margin = new Thickness(0, 4, 0, 0);
+                    left.Children.Add(reason);
+                }
+
+                left.Children.Add(UsageLine(SettingsUsage.Exemption(entry, Window._apps)));
+                Body.Children.Add(Row(left, entry.Enabled, on => entry.Enabled = on, () => _entries.Remove(entry)));
+            }
+
+            if (!Unlocked) return;
+
+            if (_error is not null) Body.Children.Add(Note(_error, warn: true));
+
+            string[] captions = ["App", "Rule", "File (optional)", "Method (optional)", "Origin (optional)"];
+            string[] hints =
+            [
+                "The app's folder name in the history folder",
+                "The rule's name as shown, e.g. No AppData",
+                "The end of the file's path, e.g. Services/ConsolePreset.cs",
+                "The method the write is in (write checks only)",
+                "Where the write points, e.g. ApplicationData (write checks only)"
+            ];
+            var boxes = new TextBox[captions.Length];
+            var grid = new Grid { Margin = new Thickness(0, 4, 0, 0) };
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(170) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            for (int i = 0; i < captions.Length + 1; i++)
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            for (int i = 0; i < captions.Length; i++)
+            {
+                var caption = Text(captions[i], "Text.Caption");
+                caption.VerticalAlignment = VerticalAlignment.Center;
+                caption.Margin = new Thickness(0, i == 0 ? 0 : 6, 12, 0);
+                Grid.SetRow(caption, i);
+                grid.Children.Add(caption);
+
+                boxes[i] = new TextBox { ToolTip = hints[i], Margin = new Thickness(0, i == 0 ? 0 : 6, 0, 0) };
+                AutomationProperties.SetName(boxes[i], "New exemption " + captions[i]);
+                Grid.SetRow(boxes[i], i);
+                Grid.SetColumn(boxes[i], 1);
+                grid.Children.Add(boxes[i]);
+            }
+
+            var reasonCaption = Text("Reason", "Text.Caption");
+            reasonCaption.VerticalAlignment = VerticalAlignment.Center;
+            reasonCaption.Margin = new Thickness(0, 6, 12, 0);
+            Grid.SetRow(reasonCaption, captions.Length);
+            grid.Children.Add(reasonCaption);
+
+            var reasonRow = new Grid { Margin = new Thickness(0, 6, 0, 0) };
+            reasonRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            reasonRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var newReason = new TextBox { ToolTip = "Why the rule doesn't apply here" };
+            AutomationProperties.SetName(newReason, "New exemption reason");
+            var addButton = new Button { Content = "Add exemption", Margin = new Thickness(8, 0, 0, 0) };
+            Grid.SetColumn(addButton, 1);
+            reasonRow.Children.Add(newReason);
+            reasonRow.Children.Add(addButton);
+            Grid.SetRow(reasonRow, captions.Length);
+            Grid.SetColumn(reasonRow, 1);
+            grid.Children.Add(reasonRow);
+
+            addButton.Click += (_, _) =>
+            {
+                string? Opt(TextBox b) => b.Text.Trim().Length == 0 ? null : b.Text.Trim();
+                var entry = new ExemptionEntry
+                {
+                    App = boxes[0].Text.Trim(), Rule = boxes[1].Text.Trim(),
+                    File = Opt(boxes[2]), Method = Opt(boxes[3]), Origin = Opt(boxes[4]),
+                    Reason = newReason.Text.Trim()
+                };
+                _error = entry.App.Length == 0 ? "Enter the app the exemption is for."
+                    : entry.Rule.Length == 0 ? "Enter the rule, as its name is shown in the findings."
+                    : entry.Reason.Length == 0 ? "Enter the reason: it's the record of why the rule doesn't apply."
+                    : _entries.Any(e => e.Key == entry.Key) ? $"{entry.Describe} is already on the list."
+                    : null;
+                if (_error is null) _entries.Add(entry);
+                Render();
+            };
+
+            var heading = Text("Add an exemption", "Text.Caption");
+            heading.Margin = new Thickness(0, 8, 0, 6);
+            Body.Children.Add(heading);
+            Body.Children.Add(grid);
+        }
+    }
+
     private enum NameKind { FileName, Pattern, Package }
 
     /// <summary>A list of names or patterns: private files, the whitelist, web packages.</summary>
@@ -611,7 +774,7 @@ public partial class SettingsWindow : Window
         public FieldsCard(SettingsWindow window, string title, string key, string description,
                           IReadOnlyList<Field> fields, Action<StandardFile, string[]> write, Func<string[], string>? preview = null)
             : base(window, title, key, description,
-                string.Join(", ", fields.Select(f => fields.Count == 1 ? f.Default : $"{f.Label} {f.Default}")),
+                string.Join(", ", fields.Select(f => fields.Count == 1 ? (f.Default.Length == 0 ? "none" : f.Default) : $"{f.Label} {f.Default}")),
                 fields.Any(f => f.FromFile is not null))
         {
             _fields = fields;
