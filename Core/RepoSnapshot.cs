@@ -23,7 +23,7 @@ public sealed class RepoSnapshot
 {
     private static readonly HashSet<string> TextExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
-        ".cs", ".xaml", ".csproj", ".sln", ".slnx", ".props", ".targets",
+        ".cs", ".xaml", ".axaml", ".csproj", ".sln", ".slnx", ".props", ".targets",
         ".json", ".xml", ".manifest", ".config", ".resx", ".pubxml"
     };
 
@@ -42,6 +42,12 @@ public sealed class RepoSnapshot
 
     public required string SourcePath { get; init; }
     public bool IsZip { get; init; }
+
+    /// <summary>
+    /// The system the snapshot is judged by, set by the rules once they have read the folder name and the
+    /// project. Windows until then.
+    /// </summary>
+    public AppPlatform Platform { get; set; }
 
     /// <summary>
     /// Every zip entry's stored time, read from the central directory; null for folder snapshots
@@ -103,6 +109,54 @@ public sealed class RepoSnapshot
         catch
         {
             return null;
+        }
+    }
+
+    /// <summary>
+    /// Reads every file up to maxBytes in one pass (the zip is opened once) and hands each one's
+    /// path and bytes to visit. Larger files and unreadable entries are skipped.
+    /// </summary>
+    public void VisitFiles(long maxBytes, Action<string, byte[]> visit) => VisitFiles(_ => true, maxBytes, visit);
+
+    /// <summary>As above, for the files whose path want accepts; the others aren't read at all.</summary>
+    public void VisitFiles(Func<string, bool> want, long maxBytes, Action<string, byte[]> visit)
+    {
+        if (!IsZip)
+        {
+            foreach (var file in Files)
+            {
+                if (file.Length > maxBytes || !want(file.RelPath)) continue;
+                var full = Path.Combine(SourcePath, file.RelPath.Replace('/', Path.DirectorySeparatorChar));
+                byte[]? bytes;
+                try { bytes = File.Exists(full) ? SharedRead.ReadAll(full) : null; }
+                catch { bytes = null; }
+                if (bytes is not null) visit(file.RelPath, bytes);
+            }
+            return;
+        }
+
+        // An unreadable zip throws to the caller, as a folder that can't be listed would.
+        using var zip = _zipBytes is not null
+            ? new ZipArchive(new MemoryStream(_zipBytes, writable: false), ZipArchiveMode.Read)
+            : SharedRead.OpenZip(SourcePath);
+        foreach (var entry in zip.Entries)
+        {
+            if (entry.Name.Length == 0 || entry.Length > maxBytes) continue;
+            var rel = Normalize(entry.FullName);
+            if (!_byPath.ContainsKey(rel) || !want(rel)) continue;
+            byte[] bytes;
+            try
+            {
+                using var stream = entry.Open();
+                using var buffer = new MemoryStream();
+                stream.CopyTo(buffer);
+                bytes = buffer.ToArray();
+            }
+            catch
+            {
+                continue;   // one damaged entry is skipped; the rest are still read
+            }
+            visit(rel, bytes);
         }
     }
 

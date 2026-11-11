@@ -48,6 +48,8 @@ public sealed class AppSettings
             {
                 var settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath), Options) ?? new AppSettings();
                 settings._savedPath = settings.LastPath;
+                // A file from before 1.0.31 is carried into today's layout in memory; it is rewritten with the next save.
+                settings.Standard?.Migrate();
                 return settings;
             }
             catch (Exception ex)

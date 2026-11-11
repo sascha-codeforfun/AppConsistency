@@ -6,6 +6,10 @@ public static class FixCatalog
     /// <summary>The single-file publish block from the standard, in the order it is written into a .csproj.</summary>
     public static (string Property, string Value)[] PublishProperties => Standard.Current.PublishProperties;
 
+    /// <summary>The same block for an app of one system: a Linux app's has the Linux runtime.</summary>
+    public static (string Property, string Value)[] PublishPropertiesFor(AppPlatform platform) =>
+        Standard.Current.PublishPropertiesFor(platform);
+
     /// <summary>The DebugType the standard expects (none by default).</summary>
     public static string DebugType => Standard.Current.Publish.DebugType;
 
@@ -54,6 +58,9 @@ public static class FixCatalog
         FixKind.ReleaseTimestamps => "Set release timestamps",
         FixKind.NoCommitInVersion => "Keep the commit out of the version",
         FixKind.AddMitLicense => "Add the MIT license",
+        FixKind.DeclareInReadme => "Add a draft declaration to the README",
+        FixKind.UndeclareInReadme => "Remove a README declaration the code no longer bears out",
+        FixKind.OptimiseImages => "Change the image files you tick, at their level",
         _ => kind.ToString()
     };
 }

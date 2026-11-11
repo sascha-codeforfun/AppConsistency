@@ -10,7 +10,7 @@
     <AssemblyName>AppConsistency</AssemblyName>
     <Product>AppConsistency</Product>
     <!-- Major and minor stay put; only the build number goes up, with every delivery. -->
-    <Version>1.0.20</Version>
+    <Version>1.0.32</Version>
 
     <ApplicationIcon>app.ico</ApplicationIcon>
 

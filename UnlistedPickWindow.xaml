@@ -3,21 +3,102 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Style="{StaticResource Hue.Window}"
         Title="AppConsistency"
-        Width="820" SizeToContent="Height" ResizeMode="CanResize" MinWidth="560"
+        Width="1240" Height="780" MinWidth="900" MinHeight="480" ResizeMode="CanResize"
         WindowStartupLocation="CenterOwner" ShowInTaskbar="False">
-    <Border Background="{DynamicResource Brush.Surface}" Padding="28,24">
-        <StackPanel>
-            <TextBlock x:Name="HeadingText" Style="{StaticResource Text.Heading}" TextWrapping="Wrap" />
-            <TextBlock x:Name="BodyText" Style="{StaticResource Text.Body}" TextWrapping="Wrap" Margin="0,8,0,0" />
-            <TextBlock x:Name="WhitelistText" Style="{StaticResource Text.Caption}" TextWrapping="Wrap" Margin="0,8,0,0" />
-            <Border Background="{DynamicResource Brush.Base}"
-                    BorderBrush="{DynamicResource Brush.LineSoft}" BorderThickness="1"
-                    CornerRadius="{StaticResource Radius.Card}" Padding="14,12" Margin="0,18,0,0">
-                <ScrollViewer MaxHeight="440" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                    <StackPanel x:Name="ListPanel" />
-                </ScrollViewer>
+    <Window.Resources>
+        <!-- The theme's input template hides its scrollbars; the preview needs them. -->
+        <ControlTemplate x:Key="PreviewTextTemplate" TargetType="TextBox">
+            <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="{StaticResource Radius.Control}"
+                    SnapsToDevicePixels="True">
+                <ScrollViewer x:Name="PART_ContentHost" Focusable="False"
+                              HorizontalScrollBarVisibility="{TemplateBinding HorizontalScrollBarVisibility}"
+                              VerticalScrollBarVisibility="{TemplateBinding VerticalScrollBarVisibility}" />
             </Border>
-            <Grid Margin="0,24,0,0">
+        </ControlTemplate>
+        <!-- The thumbnail is a button so it takes a click, Enter and Space, and shows focus. -->
+        <ControlTemplate x:Key="ThumbTemplate" TargetType="Button">
+            <Border x:Name="Bd" Background="Transparent" BorderBrush="Transparent" BorderThickness="1"
+                    CornerRadius="{StaticResource Radius.Item}" Padding="6">
+                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+            </Border>
+            <ControlTemplate.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter TargetName="Bd" Property="BorderBrush" Value="{DynamicResource Brush.LineStrong}" />
+                </Trigger>
+                <Trigger Property="IsKeyboardFocused" Value="True">
+                    <Setter TargetName="Bd" Property="BorderBrush" Value="{DynamicResource Brush.AccentLight}" />
+                </Trigger>
+            </ControlTemplate.Triggers>
+        </ControlTemplate>
+    </Window.Resources>
+    <Border Background="{DynamicResource Brush.Surface}" Padding="28,24">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <TextBlock x:Name="HeadingText" Style="{StaticResource Text.Heading}" TextWrapping="Wrap" />
+            <TextBlock x:Name="BodyText" Grid.Row="1" Style="{StaticResource Text.Body}" TextWrapping="Wrap" Margin="0,8,0,0" />
+            <TextBlock x:Name="WhitelistText" Grid.Row="2" Style="{StaticResource Text.Caption}" TextWrapping="Wrap" Margin="0,8,0,0" />
+
+            <Grid Grid.Row="3" Margin="0,18,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="2*" MinWidth="320" />
+                    <ColumnDefinition Width="14" />
+                    <ColumnDefinition Width="3*" MinWidth="380" />
+                </Grid.ColumnDefinitions>
+
+                <ListBox x:Name="FileList" Background="{DynamicResource Brush.Base}" Padding="6"
+                         SelectionMode="Single" IsTextSearchEnabled="False" SelectionChanged="FileList_SelectionChanged"
+                         PreviewKeyDown="FileList_PreviewKeyDown" />
+
+                <GridSplitter Grid.Column="1" Width="14" HorizontalAlignment="Stretch" Background="Transparent"
+                              ResizeBehavior="PreviousAndNext" Focusable="False" Cursor="SizeWE" />
+
+                <Border Grid.Column="2" Background="{DynamicResource Brush.Base}"
+                        BorderBrush="{DynamicResource Brush.LineSoft}" BorderThickness="1"
+                        CornerRadius="{StaticResource Radius.Card}" Padding="16,14">
+                    <DockPanel>
+                        <StackPanel DockPanel.Dock="Top">
+                            <TextBlock x:Name="PreviewTitle" Style="{StaticResource Text.Mono}" FontWeight="SemiBold"
+                                       Foreground="{DynamicResource Brush.Text}" TextWrapping="Wrap" />
+                            <TextBlock x:Name="PreviewFacts" Style="{StaticResource Text.Caption}" Margin="0,3,0,0" />
+
+                            <TextBlock x:Name="NamedLabel" Style="{StaticResource Text.Section}" Text="NAMED IN" Margin="0,12,0,3" />
+                            <TextBlock x:Name="NamedText" Style="{StaticResource Text.Mono}" TextWrapping="Wrap" />
+
+                            <TextBlock x:Name="PathsLabel" Style="{StaticResource Text.Section}" Text="PATHS IT NAMES" Margin="0,10,0,3" />
+                            <TextBlock x:Name="PathsText" Style="{StaticResource Text.Mono}" TextWrapping="Wrap" />
+
+                            <Border Height="1" Background="{DynamicResource Brush.LineSoft}" Margin="0,12,0,10" />
+                        </StackPanel>
+
+                        <Grid>
+                            <TextBox x:Name="PreviewText" Template="{StaticResource PreviewTextTemplate}"
+                                     IsReadOnly="True" IsReadOnlyCaretVisible="False"
+                                     TextWrapping="Wrap" VerticalContentAlignment="Top" MinHeight="0"
+                                     VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
+                                     FontFamily="{StaticResource Font.Mono}" FontSize="12" Padding="2,0"
+                                     Background="Transparent" BorderThickness="0"
+                                     Foreground="{DynamicResource Brush.Text}" Visibility="Collapsed" />
+                            <Button x:Name="ThumbButton" Template="{StaticResource ThumbTemplate}" Cursor="Hand"
+                                    ToolTip="Open at full size" Click="Thumb_Click" Visibility="Collapsed"
+                                    HorizontalAlignment="Center" VerticalAlignment="Top">
+                                <Image x:Name="ThumbImage" Stretch="Uniform" StretchDirection="Both"
+                                       RenderOptions.BitmapScalingMode="HighQuality" />
+                            </Button>
+                            <TextBlock x:Name="PreviewMessage" Style="{StaticResource Text.Body}" TextWrapping="Wrap" />
+                        </Grid>
+                    </DockPanel>
+                </Border>
+            </Grid>
+
+            <Grid Grid.Row="4" Margin="0,20,0,0">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="*" />
@@ -38,6 +119,6 @@
                             MinWidth="96" IsEnabled="False" Click="Confirm_Click" />
                 </StackPanel>
             </Grid>
-        </StackPanel>
+        </Grid>
     </Border>
 </Window>

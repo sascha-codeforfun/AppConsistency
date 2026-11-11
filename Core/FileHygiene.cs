@@ -113,9 +113,12 @@ public static class FileHygiene
     // ---------------- Whitelist ----------------
 
     /// <summary>The whitelist in words, for the removal picker.</summary>
-    public static string WhitelistText =>
-        string.Join(", ", Standard.Current.Whitelist) + ", the README and the license. Files the project uses in its build " +
-        "(resources, content, copied files) count as listed too.";
+    public static string WhitelistText => WhitelistTextFor(AppPlatform.Windows);
+
+    /// <summary>The whitelist of an app of this system, in words: a Linux app's adds its own patterns.</summary>
+    public static string WhitelistTextFor(AppPlatform platform) =>
+        string.Join(", ", Standard.Current.WhitelistFor(platform)) + ", the README and the license. Files the project names count as listed too, whether the build uses them " +
+        "(compiled, embedded, copied) or only keeps them alongside (None, such as the source drawing of an icon).";
 
 
     // Build output and tool folders have their own rule ("No build output").
@@ -124,11 +127,14 @@ public static class FileHygiene
         "bin", "obj", ".vs", "node_modules"
     };
 
-    // Item types whose files the build reads. None counts only when it is copied to the output.
+    // Item types that name a file the project uses or keeps. None counts too, copied or not: a file
+    // listed by name is there on purpose, such as the source drawing of an icon the app embeds.
     private static readonly HashSet<string> BuildItemTypes = new(StringComparer.OrdinalIgnoreCase)
     {
         "Compile", "Page", "ApplicationDefinition", "Resource", "EmbeddedResource", "Content",
-        "SplashScreen", "AdditionalFiles", "None"
+        "SplashScreen", "AdditionalFiles", "None",
+        // Avalonia's own item types: files compiled into the assembly, and its markup.
+        "AvaloniaResource", "AvaloniaXaml"
     };
 
     // Properties that name a file the build reads.
@@ -142,7 +148,7 @@ public static class FileHygiene
     public static bool IsListed(string relPath) => Standard.Current.IsWhitelisted(relPath);
 
     /// <summary>
-    /// Files that aren't on the whitelist and that no project uses in its build. Files other rules
+    /// Files that aren't on the whitelist and that no project names. Files other rules
     /// already deal with are left to them: build output, solution files, IDE files, git files,
     /// readmes, license files and your private files.
     /// </summary>
@@ -151,7 +157,7 @@ public static class FileHygiene
         var used = BuildReferenced(s, projects);
 
         return s.Files
-            .Where(f => !IsListed(f.RelPath))
+            .Where(f => !Standard.Current.IsWhitelisted(f.RelPath, s.Platform))
             .Where(f => !IsPrivate(f.RelPath))
             .Where(f => !handledElsewhere.Contains(f.RelPath))
             .Where(f => !IsGitPath(f.RelPath))
@@ -248,7 +254,7 @@ public static class FileHygiene
         Regex.IsMatch(WebAddress.Replace(text, " "),
             $@"(?<![\w.\-]){Regex.Escape(fileName)}(?![\w\-]|\.\w)", RegexOptions.IgnoreCase);
 
-    /// <summary>Snapshot files that some project reads while building: its items, wildcards included, and named files.</summary>
+    /// <summary>Snapshot files some project names: its items (None included), wildcards included, and named files.</summary>
     public static HashSet<string> BuildReferenced(RepoSnapshot s, IReadOnlyCollection<ProjectModel> projects)
     {
         var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -258,7 +264,6 @@ public static class FileHygiene
             foreach (var item in project.Items)
             {
                 if (item.Mode == ItemMode.Remove || !BuildItemTypes.Contains(item.Type)) continue;
-                if (item.Type.Equals("None", StringComparison.OrdinalIgnoreCase) && !item.Copies) continue;
 
                 foreach (var part in item.Include.Split(';'))
                     Mark(s, project.Dir, part, used);

@@ -2,7 +2,7 @@ using System.Text;
 
 namespace AppConsistency.Core;
 
-/// <summary>Plain-text report of every warning and failure, plus every license to review, for pasting elsewhere.</summary>
+/// <summary>Plain-text report of every warning and failure, plus every license and artwork to review, for pasting elsewhere.</summary>
 public static class ReportBuilder
 {
     /// <summary>One app's findings, ready to paste into the conversation that built it.</summary>
@@ -17,10 +17,10 @@ public static class ReportBuilder
             return sb.ToString();
         }
 
-        sb.AppendLine($"Snapshot {audit.SnapshotName} (newest of {audit.SnapshotCount})");
+        sb.AppendLine($"Snapshot {audit.SnapshotName} (newest of {audit.SnapshotCount})" + (audit.IsLinux ? $", {audit.PlatformLabel}" : ""));
         sb.AppendLine(audit.SnapshotPath ?? audit.FolderPath);
         sb.AppendLine($"Checked {DateTime.Now:yyyy-MM-dd HH:mm}, standard: {Standard.Current.Source}");
-        sb.AppendLine($"{audit.PassCount} good, {audit.InfoCount} info, {audit.LicenseCount} license, " +
+        sb.AppendLine($"{audit.PassCount} good, {audit.InfoCount} info, {audit.LicenseCount} license, {audit.ArtworkCount} artwork, " +
                       $"{audit.WarnCount} to review, {audit.FailCount} need attention");
         if (filterNote is not null) sb.AppendLine(filterNote);
 
@@ -51,7 +51,8 @@ public static class ReportBuilder
             $"{list.Count(a => a.Overall == CheckStatus.Warn)} warned, " +
             $"{list.Count(a => a.Overall == CheckStatus.Fail)} failed, " +
             $"{list.Count(a => a.Skipped)} without snapshots, " +
-            $"{list.Count(a => a.NeedsLicenseReview)} with a license to review");
+            $"{list.Count(a => a.NeedsLicenseReview)} with a license to review, " +
+            $"{list.Count(a => a.NeedsArtworkReview)} with artwork to review");
         sb.AppendLine();
 
         foreach (var app in list)
@@ -59,7 +60,9 @@ public static class ReportBuilder
             var label = app.Skipped ? "SKIP" : app.Overall.ToString().ToUpperInvariant();
             var source = app.Skipped ? "no numbered snapshots" : app.SnapshotName;
             var version = app.AppVersion is { } v ? $" {v}" : "";
-            var marks = (app.Elevated ? ", runs elevated" : "")
+            // Said for a Linux app only: every other app is a Windows app, as it always was.
+            var marks = (app.IsLinux && !app.Skipped ? ", Linux app" : "")
+                        + (app.Elevated ? ", runs elevated" : "")
                         + (app.HasTests ? ", has tests" : "")
                         + app.Packages switch
                         {
@@ -77,6 +80,8 @@ public static class ReportBuilder
                     sb.AppendLine($"    EXEMPT {r.Category} / {r.Rule}: {r.ExemptReason}");
                 else if (r.Status == CheckStatus.License && app.NeedsLicenseReview)
                     sb.AppendLine($"    LIC   {r.Category} / {r.Rule}: review license. {Indent(r.Detail, 10)}");
+                else if (r.Status == CheckStatus.Artwork)
+                    sb.AppendLine($"    ART   {r.Category} / {r.Rule}: {Indent(r.Detail, 10)}");
             }
         }
 

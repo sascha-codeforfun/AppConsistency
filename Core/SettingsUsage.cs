@@ -43,6 +43,22 @@ public static class SettingsUsage
         return new Usage(lines.Count, scanned.Count, lines, $"used by {lines.Count} of {Apps(scanned.Count)}");
     }
 
+    /// <summary>The image files one image level entry covers in its app.</summary>
+    public static Usage ImageLevel(ImageLevelEntry entry, IReadOnlyList<AppAudit> apps)
+    {
+        var scanned = Scanned(apps);
+        var glob = Standard.Glob(entry.Path);
+        var lines = new List<string>();
+        foreach (var app in scanned.Where(a => a.AppName.Equals(entry.App.Trim(), StringComparison.OrdinalIgnoreCase)))
+        {
+            var hits = app.Images.Where(i => glob.IsMatch(i.RelPath)).Select(i => i.RelPath).ToList();
+            if (hits.Count > 0) lines.AddRange(hits.Select(h => $"{app.AppName}: {h}"));
+        }
+        int apps1 = lines.Count > 0 ? 1 : 0;
+        return new Usage(apps1, scanned.Count, lines,
+            lines.Count == 0 ? "matches no image file in the last scan" : $"matches {lines.Count} image file{(lines.Count == 1 ? "" : "s")}");
+    }
+
     /// <summary>Apps with a file of exactly this name, at any depth.</summary>
     public static Usage FileName(string name, IReadOnlyList<AppAudit> apps)
     {

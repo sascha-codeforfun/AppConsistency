@@ -9,6 +9,7 @@ using System.Windows.Controls.Primitives;
 using System.Windows.Data;
 using System.Windows.Documents;
 using System.Windows.Input;
+using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using Microsoft.Win32;
 using AppConsistency.Core;
@@ -35,6 +36,9 @@ public partial class MainWindow : Window
     private readonly Dictionary<AppAudit, HashSet<FixTarget>> _queues = new();
     /// <summary>The files ticked in the removal picker, per app, while that fix is queued.</summary>
     private readonly Dictionary<AppAudit, List<string>> _unlistedPicks = new();
+    private readonly Dictionary<AppAudit, Dictionary<string, ImageChange>> _imageChanges = new();
+    /// <summary>Decoded image files of the apps opened lately, by snapshot path, for the Image files row.</summary>
+    private readonly Dictionary<string, Task<Dictionary<string, BitmapSource?>>> _pictures = new(StringComparer.OrdinalIgnoreCase);
     private List<CheckRowView> _rows = new();
 
     /// <summary>Selected filter pill; null shows everything. Kept when switching apps.</summary>
@@ -91,6 +95,7 @@ public partial class MainWindow : Window
     {
         null => true,
         CheckStatus.License => app.NeedsLicenseReview,
+        CheckStatus.Artwork => app.NeedsArtworkReview,
         var status => app.Overall == status
     };
 
@@ -116,6 +121,8 @@ public partial class MainWindow : Window
         SetBusy(true);
         _queues.Clear();
         _unlistedPicks.Clear();
+        _imageChanges.Clear();
+        _pictures.Clear();
         _apps.Clear();
         _appFilter = null;
         CollectionViewSource.GetDefaultView(_apps).Refresh();
@@ -293,6 +300,7 @@ public partial class MainWindow : Window
         Set(WarnPill, CheckStatus.Warn, _apps.Count(a => a.Overall == CheckStatus.Warn), "warned", "Warn");
         Set(FailPill, CheckStatus.Fail, _apps.Count(a => a.Overall == CheckStatus.Fail), "failed", "Error");
         Set(LicensePill, CheckStatus.License, _apps.Count(a => a.NeedsLicenseReview), "license", "Indigo");
+        Set(ArtworkPill, CheckStatus.Artwork, _apps.Count(a => a.NeedsArtworkReview), "artwork", "Indigo");
         SummaryPills.Visibility = _apps.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
     }
 
@@ -303,6 +311,7 @@ public partial class MainWindow : Window
         var status = pill == PassPill ? CheckStatus.Pass
             : pill == WarnPill ? CheckStatus.Warn
             : pill == LicensePill ? CheckStatus.License
+            : pill == ArtworkPill ? CheckStatus.Artwork
             : CheckStatus.Fail;
 
         _appFilter = _appFilter == status ? null : status;
@@ -324,6 +333,7 @@ public partial class MainWindow : Window
             CheckStatus.Warn => " Showing only warned apps.",
             CheckStatus.Fail => " Showing only failed apps.",
             CheckStatus.License => " Showing only apps with a license to review.",
+            CheckStatus.Artwork => " Showing only apps with artwork to review.",
             _ => ""
         };
         SetStatus(SummaryLine() + note, "Brush.Ok");
@@ -336,10 +346,12 @@ public partial class MainWindow : Window
         int pass = _apps.Count(a => a.Overall == CheckStatus.Pass);
         int skipped = _apps.Count(a => a.Skipped);
         int license = _apps.Count(a => a.NeedsLicenseReview);
+        int artwork = _apps.Count(a => a.NeedsArtworkReview);
 
         var text = $"Checked {_apps.Count} app{(_apps.Count == 1 ? "" : "s")}: {pass} passed, {warn} warned, {fail} failed";
         if (skipped > 0) text += $", {skipped} without snapshots";
         if (license > 0) text += $"; {license} with a license to review";
+        if (artwork > 0) text += $"; {artwork} with artwork to review";
         text += ".";
 
         // An exemption for an app that isn't in the folder can't be reported by any app's scan. Only on a
@@ -515,6 +527,7 @@ public partial class MainWindow : Window
             bool same = old.Signature == audit.Signature;
             if (_queues.Remove(old, out var queue) && same) _queues[audit] = queue;
             if (_unlistedPicks.Remove(old, out var picks) && same) _unlistedPicks[audit] = picks;
+            if (_imageChanges.Remove(old, out var images) && same) _imageChanges[audit] = images;
         }
 
         int index = old is null ? -1 : _apps.IndexOf(old);
@@ -553,6 +566,7 @@ public partial class MainWindow : Window
     {
         _queues.Remove(app);
         _unlistedPicks.Remove(app);
+        _imageChanges.Remove(app);
         _apps.Remove(app);
         UpdateSummaryPills();
         SetStatus($"{app.AppName}: the folder is gone, so it's off the list.", "Brush.Warn");
@@ -633,6 +647,12 @@ public partial class MainWindow : Window
         DetailName.Text = audit.AppName;
         DetailVersion.Text = audit.AppVersion ?? (audit.Skipped || audit.Pending ? "" : "no version");
         DetailVersion.SetResourceReference(TextBlock.ForegroundProperty, audit.AppVersion is null ? "Brush.TextMuted" : "Brush.TextDim");
+        // Which system the app is for, said outright so it needn't be read off the name.
+        SystemBadge.Visibility = audit.Skipped || audit.Pending ? Visibility.Collapsed : Visibility.Visible;
+        SystemBadgeText.Text = AppPlatforms.Word(audit.Platform);
+        SystemBadge.ToolTip = audit.IsLinux
+            ? "A Linux app: checked against the Linux part of the standard (Avalonia, a linux- runtime, the Linux package list)."
+            : "A Windows app: checked against the Windows standard (WPF, a win- runtime).";
         AdminBadge.Visibility = audit.Elevated ? Visibility.Visible : Visibility.Collapsed;
         TestsBadge.Visibility = audit.HasTests ? Visibility.Visible : Visibility.Collapsed;
         // The word says what the state is; the amber only ranks it.
@@ -647,7 +667,7 @@ public partial class MainWindow : Window
         DetailSource.Text = audit.SnapshotPath ?? audit.FolderPath;
         DetailSummary.Text = audit.Skipped
             ? "No numbered snapshots in this folder."
-            : $"Snapshot {audit.VersionText}, newest of {audit.SnapshotCount}.";
+            : $"Snapshot {audit.VersionText}, newest of {audit.SnapshotCount}" + SizeLine(audit) + ".";
 
         RefreshChecks();
         UpdateApplyButton();
@@ -665,6 +685,9 @@ public partial class MainWindow : Window
             .Select(r => new CheckRowView(r, r.CanFix && queue?.Contains(r.Target) == true))
             .ToList();
 
+        foreach (var row in _rows.Where(r => r.Rule == "Image files" && _current.Images.Count > 0))
+            ShowThumbs(_current, row);
+
         var groups = _rows
             .GroupBy(row => row.Result.Category)
             .Select(g => new CheckGroup(g.Key, g.ToList()))
@@ -678,6 +701,7 @@ public partial class MainWindow : Window
             CheckStatus.Fail => "Nothing needs attention in this app.",
             CheckStatus.Warn => "Nothing to review in this app.",
             CheckStatus.License => "No license finding in this app.",
+            CheckStatus.Artwork => "No artwork finding in this app.",
             CheckStatus.Info => "No informational findings in this app.",
             CheckStatus.Pass => "No checks pass in this app.",
             _ => "Nothing to check."
@@ -729,12 +753,14 @@ public partial class MainWindow : Window
 
         int Count(CheckStatus status) => _current.Results.Count(r => r.Status == status);
         int fail = Count(CheckStatus.Fail), warn = Count(CheckStatus.Warn), license = Count(CheckStatus.License),
+            artwork = Count(CheckStatus.Artwork),
             info = Count(CheckStatus.Info), pass = Count(CheckStatus.Pass);
 
         FilterAll.Content = $"All {_current.Results.Count}";
         FilterFailText.Text = $"{fail} need attention";
         FilterWarnText.Text = $"{warn} to review";
         FilterLicenseText.Text = $"{license} license";
+        FilterArtworkText.Text = $"{artwork} artwork";
         FilterInfoText.Text = $"{info} info";
         FilterPassText.Text = $"{pass} good";
 
@@ -742,6 +768,7 @@ public partial class MainWindow : Window
         FilterFail.IsEnabled = fail > 0 || _filter == CheckStatus.Fail;
         FilterWarn.IsEnabled = warn > 0 || _filter == CheckStatus.Warn;
         FilterLicense.IsEnabled = license > 0 || _filter == CheckStatus.License;
+        FilterArtwork.IsEnabled = artwork > 0 || _filter == CheckStatus.Artwork;
         FilterInfo.IsEnabled = info > 0 || _filter == CheckStatus.Info;
         FilterPass.IsEnabled = pass > 0 || _filter == CheckStatus.Pass;
 
@@ -749,6 +776,7 @@ public partial class MainWindow : Window
         FilterFail.IsChecked = _filter == CheckStatus.Fail;
         FilterWarn.IsChecked = _filter == CheckStatus.Warn;
         FilterLicense.IsChecked = _filter == CheckStatus.License;
+        FilterArtwork.IsChecked = _filter == CheckStatus.Artwork;
         FilterInfo.IsChecked = _filter == CheckStatus.Info;
         FilterPass.IsChecked = _filter == CheckStatus.Pass;
     }
@@ -1014,7 +1042,7 @@ public partial class MainWindow : Window
             SetBusy(true, showCursor: false);
             try
             {
-                picks = UnlistedPickWindow.Ask(this, audit.AppName, audit.Unlisted);
+                picks = UnlistedPickWindow.Ask(this, audit.AppName, audit.Unlisted, audit.SnapshotPath, audit.Platform);
             }
             finally
             {
@@ -1032,6 +1060,34 @@ public partial class MainWindow : Window
         else if (row.Fix == FixKind.RemoveUnlistedFiles)
         {
             _unlistedPicks.Remove(audit);
+        }
+
+        // Image files: a level and a decision per file, and a palette only where it was compared and ticked.
+        if (row.Fix == FixKind.OptimiseImages && row.IsQueued)
+        {
+            ImagePickWindow.Outcome? outcome;
+            SetBusy(true, showCursor: false);
+            try
+            {
+                outcome = ImagePickWindow.Ask(this, audit.AppName, audit.Images, audit.SnapshotPath);
+            }
+            finally
+            {
+                SetBusy(false);
+            }
+
+            if (outcome is not null && outcome.Remember.Count > 0) RememberImageLevels(outcome.Remember);
+            if (outcome is null || outcome.Changes.Count == 0 || _current != audit)
+            {
+                row.IsQueued = false;
+                UpdateApplyButton();
+                return;
+            }
+            _imageChanges[audit] = outcome.Changes;
+        }
+        else if (row.Fix == FixKind.OptimiseImages)
+        {
+            _imageChanges.Remove(audit);
         }
 
         // The ToggleButton has already moved; the queue follows it.
@@ -1054,6 +1110,7 @@ public partial class MainWindow : Window
             if (audit is not { IsZipSnapshot: true, Pending: false, SnapshotPath: { } source }) return;
             if (!_queues.TryGetValue(audit, out var queue) || queue.Count == 0) return;
             _unlistedPicks.TryGetValue(audit, out var picks);
+            _imageChanges.TryGetValue(audit, out var imageChanges);
 
             var target = Path.Combine(KnownFolders.Downloads, Staging.StagedName(source));
             if (ReportIfExists(target)) return;
@@ -1063,7 +1120,7 @@ public partial class MainWindow : Window
             {
                 var fixes = queue.ToList();
                 var ticked = picks?.ToList();
-                plan = await Working(() => FixPlanner.Plan(source, target, fixes, ticked, day));
+                plan = await Working(() => FixPlanner.Plan(source, target, fixes, ticked, day, imageChanges));
             }
             catch (Exception ex)
             {
@@ -1118,6 +1175,7 @@ public partial class MainWindow : Window
                 await Working(() => FixPlanner.Apply(plan));
                 queue.Clear();
                 _unlistedPicks.Remove(audit);
+                _imageChanges.Remove(audit);
                 foreach (var row in _rows) row.IsQueued = false;
                 UpdateApplyButton();
                 ShowNotice(
@@ -1134,6 +1192,115 @@ public partial class MainWindow : Window
         {
             SetBusy(false);
         }
+    }
+
+    /// <summary>
+    /// Levels changed in the image picker, saved as entries in Settings: one per file, replacing an
+    /// entry for the same app and path. They apply from the next scan; the findings shown now stay.
+    /// </summary>
+    private void RememberImageLevels(List<ImageLevelEntry> entries)
+    {
+        if (_settings.Problem is not null)
+        {
+            ShowNotice("The levels weren't remembered: AppConsistency.json couldn't be read, so it isn't written.", success: false);
+            return;
+        }
+        // A new list, set only for the save: when the save fails, the settings in memory are as before.
+        var oldStandard = _settings.Standard;
+        var file = _settings.Standard ?? new StandardFile();
+        var oldLevels = file.ImageLevels;
+        var list = new List<ImageLevelEntry>(oldLevels ?? new List<ImageLevelEntry>());
+        foreach (var e in entries)
+        {
+            list.RemoveAll(x => x.Key == e.Key);
+            list.Add(e);
+        }
+        file.ImageLevels = list;
+        _settings.Standard = file;
+        try
+        {
+            _settings.SaveAll();
+            Standard.Current = _settings.ToStandard();
+            ShowVersion();
+            ShowNotice($"Remembered {entries.Count} image level{(entries.Count == 1 ? "" : "s")} in Settings. They apply from the next scan.", success: true);
+        }
+        catch (Exception ex)
+        {
+            file.ImageLevels = oldLevels;
+            _settings.Standard = oldStandard;
+            ShowNotice("The levels couldn't be saved: " + ex.Message, success: false);
+        }
+    }
+
+    /// <summary>" · 2.1 MB packed, 6.3 MB unpacked, 214 files", or "" before a scan.</summary>
+    private static string SizeLine(AppAudit audit)
+    {
+        if (audit.FileCount == 0) return "";
+        var packed = audit.PackedSize is { } p ? $"{SizeText(p)} packed, " : "";
+        return $"  ·  {packed}{SizeText(audit.UnpackedSize)} unpacked, {audit.FileCount} file{(audit.FileCount == 1 ? "" : "s")}";
+    }
+
+    private static string SizeText(long bytes) =>
+        bytes < 1024 ? $"{bytes} B" : bytes < 1024 * 1024 ? $"{bytes / 1024.0:0.#} KB" : $"{bytes / 1024.0 / 1024.0:0.#} MB";
+
+    /// <summary>
+    /// Fills the Image files row with a preview of every image file, to-do ones first. The files are
+    /// read from the snapshot once per app and kept for the last few apps opened; the scan never
+    /// reads them for this.
+    /// </summary>
+    private async void ShowThumbs(AppAudit audit, CheckRowView row)
+    {
+        var images = audit.Images.OrderByDescending(i => i.NeedsWork).ThenBy(i => i.RelPath, StringComparer.OrdinalIgnoreCase).ToList();
+        foreach (var f in images)
+        {
+            row.Thumbs.Add(new ImageThumbView
+            {
+                RelPath = f.RelPath,
+                Name = RepoSnapshot.NameOf(f.RelPath),
+                Caption = SizeText(f.Length) + (f.NeedsWork ? " · to do" : f.Level == ImageKit.ImageLevel.AsIs ? " · as is" : ""),
+                ToDo = f.NeedsWork
+            });
+        }
+        if (audit.SnapshotPath is not { } path) return;
+
+        if (!_pictures.TryGetValue(path, out var loading))
+        {
+            if (_pictures.Count >= 6) _pictures.Clear();
+            var wanted = new HashSet<string>(images.Where(i => i.Problem is null).Select(i => i.RelPath), StringComparer.OrdinalIgnoreCase);
+            bool isZip = audit.IsZipSnapshot;
+            loading = Task.Run(() =>
+            {
+                var pictures = new Dictionary<string, BitmapSource?>(StringComparer.OrdinalIgnoreCase);
+                try
+                {
+                    RepoSnapshot.Load(path, isZip).VisitFiles(wanted.Contains, 64L * 1024 * 1024,
+                        (rel, bytes) => pictures[rel] = ImagePickWindow.Decode(bytes));
+                }
+                catch
+                {
+                    // An unreadable snapshot leaves the previews empty; the row still lists the files.
+                }
+                return pictures;
+            });
+            _pictures[path] = loading;
+        }
+
+        var found = await loading;
+        foreach (var thumb in row.Thumbs)
+        {
+            if (found.TryGetValue(thumb.RelPath, out var picture) && picture is not null)
+            {
+                thumb.Image = picture;
+                thumb.Status = "";
+            }
+            else thumb.Status = "no preview";
+        }
+    }
+
+    private void RowThumb_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not ImageThumbView thumb || thumb.Image is null) return;
+        new ImageZoomWindow(thumb.Image, thumb.RelPath) { Owner = this }.Show();
     }
 
     private HashSet<FixTarget> QueueFor(AppAudit audit)
@@ -1178,7 +1345,7 @@ public partial class MainWindow : Window
     {
         if (_current is null) return;
 
-        var approved = StandardsRules.Allowlist.ToList();
+        var approved = StandardsRules.AllowlistFor(_current.Platform).ToList();
         var used = _current.PackageUses.Where(p => p.State != PackageUseState.TestOnly).ToList();
         var testOnly = _current.PackageUses.Where(p => p.State == PackageUseState.TestOnly).ToList();
         var unused = approved
@@ -1187,7 +1354,7 @@ public partial class MainWindow : Window
 
         int width = Math.Max(
             _current.PackageUses.Count == 0 ? 0 : _current.PackageUses.Max(p => p.Name.Length),
-            approved.Max(p => p.Name.Length));
+            approved.Count == 0 ? 0 : approved.Max(p => p.Name.Length));
 
         var lines = new List<(string Text, string? BrushKey)>();
 
@@ -1242,6 +1409,7 @@ public partial class MainWindow : Window
             CheckStatus.Fail => "Showing only findings that need attention.",
             CheckStatus.Warn => "Showing only findings to review.",
             CheckStatus.License => "Showing only the license finding.",
+            CheckStatus.Artwork => "Showing only the artwork finding.",
             CheckStatus.Info => "Showing only informational findings.",
             CheckStatus.Pass => "Showing only checks that pass.",
             _ => null

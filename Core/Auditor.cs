@@ -16,6 +16,8 @@ public static class Auditor
             SnapshotPath = candidate.LatestPath,
             VersionText = candidate.VersionText,
             SnapshotCount = candidate.SnapshotCount,
+            // Until the project has been read, the system is the one the folder name says.
+            Platform = AppPlatforms.Filed(candidate.AppName),
             // Taken before reading: if the file changes while it's read, the next look sees a difference.
             Fingerprint = RepoLocator.Fingerprint(candidate)
         };
@@ -31,6 +33,7 @@ public static class Auditor
             var snapshot = RepoSnapshot.Load(candidate.LatestPath, candidate.LatestIsZip);
             audit.Results.AddRange(StandardsRules.Run(snapshot, out var facts, candidate.AppName));
             foreach (var (key, count) in facts.ExemptionUses) audit.ExemptionUses[key] = count;
+            audit.Platform = facts.Platform;
             audit.HasTests = facts.HasTests;
             audit.Packages = facts.Packages;
             audit.PackageUses.AddRange(facts.PackageUses);
@@ -42,6 +45,10 @@ public static class Auditor
             audit.PrivateFiles.AddRange(facts.PrivateFiles);
             audit.PrivateMentions.AddRange(facts.PrivateMentions);
             audit.AllFiles.AddRange(facts.AllFiles);
+            audit.Images.AddRange(facts.Images);
+            audit.PackedSize = facts.PackedSize;
+            audit.UnpackedSize = facts.UnpackedSize;
+            audit.FileCount = facts.FileCount;
         }
         catch (Exception ex) when (candidate.LatestIsZip && IsStillBeingWritten(candidate.LatestPath, ex))
         {

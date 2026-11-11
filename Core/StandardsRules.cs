@@ -52,21 +52,32 @@ public static class StandardsRules
         @"Assembly(?:\(\))?\s*\??\.\s*Location\b",
         RegexOptions.Compiled);
 
-    // Third-party packages accepted as known exceptions, from the settings. The built-in list is empty:
-    // which packages to trust is yours to decide, and the public code carries no one's choice.
-    private static IReadOnlyDictionary<string, PackageEntry> AllowedPackages => Standard.Current.ApprovedPackages;
+    // Third-party packages accepted as known exceptions come from the settings, in three lists: Hybrid (both
+    // systems), Windows and Linux. An app is held to Hybrid plus its own system's. The built-in lists are
+    // empty: which packages to trust is yours to decide, and the public code carries no one's choice.
 
     private static readonly Regex VersionNumber = new(@"\d+(?:\.\d+){0,3}", RegexOptions.Compiled);
 
-    /// <summary>The approved list, for showing in the app.</summary>
-    public static IEnumerable<(string Name, string MinVersion, string Reason)> Allowlist =>
-        AllowedPackages
+    /// <summary>
+    /// The packages an app of this system may use, for showing in the app: the Hybrid list and the system's
+    /// own, by name, each marked with the list it is on. A name on both is shown once, as Hybrid.
+    /// </summary>
+    public static IEnumerable<(string Name, string MinVersion, string Reason)> AllowlistFor(AppPlatform platform)
+    {
+        var standard = Standard.Current;
+        var own = AppPlatforms.Word(platform);
+        return standard.HybridApprovedPackages.Select(p => (p.Key, p.Value, List: "Hybrid"))
+            .Concat(standard.SystemApprovedPackages(platform)
+                .Where(p => !standard.HybridApprovedPackages.ContainsKey(p.Key))
+                .Select(p => (p.Key, p.Value, List: own)))
             .OrderBy(p => p.Key, StringComparer.OrdinalIgnoreCase)
-            .Select(p => (p.Key, p.Value.MinVersion, p.Value.Reason));
+            .Select(p => (p.Key, p.Value.MinVersion, $"{p.Value.Reason} [{p.List}]".TrimStart()));
+    }
 
-    /// <summary>The note an unapproved package gets when no approved packages are set up at all.</summary>
-    private static string EmptyListNote =>
-        AllowedPackages.Count == 0 ? " No approved packages are configured yet: add them in Settings." : "";
+    /// <summary>The note an unapproved package gets when no approved packages are set up at all for its system.</summary>
+    private static string EmptyListNote(AppPlatform platform) =>
+        Standard.Current.HybridApprovedPackages.Count == 0 && Standard.Current.SystemApprovedPackages(platform).Count == 0
+            ? " No approved packages are configured yet: add them in Settings." : "";
 
     // Package ids (prefix match) that mark a project as a test project.
     private static readonly string[] TestPackagePrefixes =
@@ -86,15 +97,30 @@ public static class StandardsRules
         RegexOptions.Compiled);
 
     /// <param name="appName">The app folder's name, which exemptions are matched against; empty applies none.</param>
-    public static List<CheckResult> Run(RepoSnapshot snapshot, out ScanFacts facts, string appName = "")
+    /// <param name="filedAs">
+    /// The system the folder name files the app under. Left out, it is read from appName; the fix planner,
+    /// which runs the rules without an app name, passes it.
+    /// </param>
+    public static List<CheckResult> Run(RepoSnapshot snapshot, out ScanFacts facts, string appName = "", AppPlatform? filedAs = null)
     {
         var results = new List<CheckResult>();
         facts = new ScanFacts();
         var exemptions = new ExemptionMatcher(appName);
         facts.AllFiles.AddRange(snapshot.Files.Select(f => f.RelPath));
+        facts.FileCount = snapshot.Files.Count;
+        facts.UnpackedSize = snapshot.Files.Sum(f => f.Length);
+        facts.PackedSize = SnapshotSize(snapshot);
+
+        // Which system the app is for, decided once: every rule below reads it from here.
+        var system = SystemOf(snapshot, filedAs ?? AppPlatforms.Filed(appName));
+        snapshot.Platform = system.Platform;
+        facts.Platform = system.Platform;
+        bool linux = system.Platform == AppPlatform.Linux;
 
         PackageRules(snapshot, results, facts);
-        var (project, tests) = ProjectRules(snapshot, results);
+        ImageRule(snapshot, results, facts, appName);
+        if (system.Row is not null) results.Add(system.Row);
+        var (project, tests) = ProjectRules(snapshot, results, linux);
         facts.HasTests = tests.Count > 0;
         ReadmeRule(snapshot, results, facts);
         PrivateMentionsRule(snapshot, results, facts);
@@ -113,8 +139,8 @@ public static class StandardsRules
         if (project is not null)
         {
             TestIsolationRule(project, tests, results);
-            PublishRules(snapshot, project, results);
-            IconRules(snapshot, appFiles, project, results);
+            PublishRules(snapshot, project, results, system);
+            IconRules(snapshot, appFiles, project, results, linux);
         }
         else
         {
@@ -122,26 +148,114 @@ public static class StandardsRules
             results.Report(Icons, "Icon wiring", CheckStatus.Info, "Skipped: no readable app project.");
         }
 
-        HeaderRule(appFiles, results);
-        DarkTitleBarRule(appFiles, results);
-        DarkBackgroundRule(appFiles, results);
+        HeaderRule(appFiles, results, linux);
+        DarkTitleBarRule(appFiles, results, linux);
+        if (linux) DarkThemeRule(appFiles, results);
+        DarkBackgroundRule(appFiles, results, linux);
+
+        // Where the code writes, worked out once: the write rules list it, the README declarations use it.
+        var writes = WriteSites(appFiles, project);
 
         if (project is not null)
         {
             var shipped = ShippedProjects(snapshot, project);
-            DependencyRules(snapshot, project, shipped, tests, results, facts);
-            ElevationRules(snapshot, appFiles, project, shipped, results);
+            var shippedCode = ShippedCode(snapshot, shipped);
+            DependencyRules(snapshot, project, shipped, tests, results, facts, system.Platform);
+            if (linux) AvaloniaVersionRule(shipped, results);
+            // The code is read once for what it does: the admin rights row and the README declarations share it.
+            var found = DeclarationScan.ScanCode(shippedCode, linux);
+            ElevationRules(snapshot, appFiles, project, shipped, results, linux, found);
+            DeclarationRule(snapshot, shippedCode, project, writes, results, linux, found);
+            if (linux) LinuxProgramRules(snapshot, appFiles, shippedCode, project, results);
         }
+        else
+            DeclarationRule(snapshot, appFiles, null, writes, results, linux, DeclarationScan.ScanCode(appFiles, linux));
 
         ReproducibleRules(snapshot, appFiles, SelectProjects(snapshot).Apps, results);
         LeakRules(snapshot, appFiles, results);
         CodeRules(appFiles, results);
-        WriteRules(appFiles, project, results, exemptions);
+        WriteRules(writes, project, results, exemptions, linux);
 
         exemptions.ApplyTo(results);
         exemptions.ReportUnused(results);
         facts.ExemptionUses = exemptions.Uses;
         return results;
+    }
+
+    // ================= Which system =================
+
+    public const string SystemRule = "System";
+
+    /// <param name="Platform">The system the rules judge the app by.</param>
+    /// <param name="Row">The cross-check of folder and project: always for a Linux app, for a Windows app only when something is off.</param>
+    /// <param name="RuntimeReported">The project's runtime contradicts the folder and Row says so; Publish settings doesn't say it again.</param>
+    private sealed record AppSystem(AppPlatform Platform, CheckResult? Row, bool RuntimeReported = false);
+
+    /// <summary>The system a snapshot's rules run under, from its folder name and its app project; no row is made.</summary>
+    public static AppPlatform PlatformOf(RepoSnapshot snapshot, AppPlatform filed) => SystemOf(snapshot, filed).Platform;
+
+    /// <summary>
+    /// A Linux app is one filed in a folder whose name ends in LINUX. The project has to agree: a
+    /// Windows-only project in a LINUX folder, or a Linux project in a plain one, is a snapshot in the wrong
+    /// folder. That is said once, here, and the rest of the rules then judge the app by what its project
+    /// is, so a misfiled snapshot gets one clear failure and not a list of the other system's rules.
+    /// </summary>
+    private static AppSystem SystemOf(RepoSnapshot s, AppPlatform filed)
+    {
+        var (main, _, _) = SelectProjects(s);
+        if (main is not null && main.ParseError is not null) main = null;
+
+        var rid = main?.Prop("RuntimeIdentifier");
+        var tfm = main?.Prop("TargetFramework");
+        bool linuxRuntime = rid?.StartsWith("linux-", StringComparison.OrdinalIgnoreCase) == true;
+        bool windowsRuntime = rid?.StartsWith("win-", StringComparison.OrdinalIgnoreCase) == true;
+
+        var windowsOnly = new List<string>();
+        if (main?.IsTrue("UseWPF") == true) windowsOnly.Add("uses WPF");
+        if (main?.IsTrue("UseWindowsForms") == true) windowsOnly.Add("uses Windows Forms");
+        if (Core.Standard.ParseTargetFramework(tfm) is { } parsed && parsed.Platform == "windows") windowsOnly.Add($"targets {tfm}");
+
+        CheckResult Row(CheckStatus status, string detail) => new(Project, SystemRule, status, detail);
+        const string suffix = AppPlatforms.LinuxSuffix;
+
+        if (filed == AppPlatform.Linux)
+        {
+            if (main is null)
+                return new(AppPlatform.Linux, Row(CheckStatus.Info,
+                    $"Filed as a Linux app (the folder name ends in {suffix}). There is no readable app project to compare that with."));
+
+            if (windowsOnly.Count > 0)
+                return new(AppPlatform.Windows, Row(CheckStatus.Fail,
+                    $"A Windows-only project filed as Linux: {main.RelPath} {string.Join(" and ", windowsOnly)}, but the folder name ends in {suffix}. " +
+                    $"The snapshot is in the wrong folder: a Windows app belongs in a folder without the {suffix} suffix. " +
+                    "The other checks treat it as the Windows app it is."));
+
+            if (windowsRuntime)
+                return new(AppPlatform.Linux, Row(CheckStatus.Fail,
+                    $"The project is for Windows, the folder says Linux: {main.RelPath} sets RuntimeIdentifier {rid}, but the folder name ends in {suffix}. " +
+                    $"Either the runtime is wrong (a Linux app declares {Core.Standard.Current.LinuxRuntimeIdentifier}) or the snapshot is in the wrong folder. " +
+                    "The other checks treat it as a Linux app."), RuntimeReported: true);
+
+            return new(AppPlatform.Linux, Row(CheckStatus.Pass, linuxRuntime
+                ? $"Linux app: the folder name ends in {suffix} and {main.RelPath} sets RuntimeIdentifier {rid}."
+                : $"Linux app by its folder name, which ends in {suffix}. {main.RelPath} sets no RuntimeIdentifier; see Publish settings."));
+        }
+
+        if (linuxRuntime && windowsOnly.Count == 0 && main is not null)
+            return new(AppPlatform.Linux, Row(CheckStatus.Fail,
+                $"A Linux project filed as Windows: {main.RelPath} sets RuntimeIdentifier {rid}, but the folder name doesn't end in {suffix}. " +
+                $"The snapshot is in the wrong folder: a Linux app belongs in a folder named <App>{suffix}. " +
+                "The other checks treat it as the Linux app it is."));
+
+        // Avalonia markup in a folder that isn't a Linux app's: something is off, whatever the project says.
+        var axaml = s.Files.Where(f => f.Extension == ".axaml").Select(f => f.RelPath).ToList();
+        if (axaml.Count > 0)
+            return new(AppPlatform.Windows, Row(CheckStatus.Warn,
+                $"{Plural(axaml.Count, ".axaml file")} ({Sample(axaml, 3)}) in a folder whose name doesn't end in {suffix}. " +
+                $".axaml is Avalonia markup, which this standard uses for Linux apps: a Linux app belongs in a folder named <App>{suffix}. " +
+                "Checked as a Windows app."));
+
+        return new(AppPlatform.Windows, null);
     }
 
     // ================= Package =================
@@ -267,8 +381,8 @@ public static class StandardsRules
                 ? "1 file not on the whitelist, used by the README, so it's documentation."
                 : $"{documented.Count} files not on the whitelist, all used by the README, so they're documentation."
             : documented.Count == 0
-                ? $"{Plural(loose.Count, "file")} not on the whitelist and not used by the build or the README."
-                : $"{Plural(loose.Count, "file")} not on the whitelist and not used by the build or the README; " +
+                ? $"{Plural(loose.Count, "file")} not on the whitelist and not named by a project or the README."
+                : $"{Plural(loose.Count, "file")} not on the whitelist and not named by a project or the README; " +
                   $"{Plural(documented.Count, "more file", "more files")} the README uses.";
 
         if (!s.IsZip)
@@ -281,6 +395,113 @@ public static class StandardsRules
             counts + " Whether they belong depends on the repo: the fix lets you tick the ones to remove." + lists,
             FixKind.RemoveUnlistedFiles);
     }
+
+    /// <summary>
+    /// Image files (PNG, ICO, JPEG, by content) against their level from Settings: metadata nothing
+    /// displays, and savings without loss. Not a verdict: a picture can be fine as it is, so the
+    /// row is Artwork, apart from the warnings, and never makes the app warn. Files kept as they
+    /// are (As is) are listed for information. The fix lets you choose per file.
+    /// </summary>
+    private static void ImageRule(RepoSnapshot s, List<CheckResult> r, ScanFacts facts, string appName)
+    {
+        const string rule = "Image files";
+        List<ImageFinding> images;
+        try
+        {
+            images = ImageScan.Scan(s, appName);
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException)
+        {
+            r.Report(Package, rule, CheckStatus.Info, "The image files couldn't be read: " + ex.Message);
+            return;
+        }
+        facts.Images.AddRange(images);
+
+        if (images.Count == 0)
+        {
+            r.Report(Package, rule, CheckStatus.Pass, "No PNG, ICO or JPEG files.");
+            return;
+        }
+
+        var work = images.Where(i => i.NeedsWork).ToList();
+        var asIs = images.Where(i => i.Level == ImageKit.ImageLevel.AsIs).ToList();
+        var problems = images.Where(i => i.Problem is not null).ToList();
+
+        string Line(ImageFinding f)
+        {
+            var parts = new List<string>();
+            if (f.Removable.Count > 0) parts.Add("carries " + string.Join(", ", f.Removable.Select(Lower)));
+            if (f.Level >= ImageKit.ImageLevel.Lossless && ImageScan.SavingCounts(f.Saving, f.Length))
+                parts.Add($"about {Size(f.Saving)} ({100.0 * f.Saving / f.Length:0} %) smaller without loss");
+            var level = $"{LevelWord(f.Level)}{(f.LevelFrom == "default" ? ", default" : "")}";
+            return $"\n    {f.RelPath}  ({Size(f.Length)}, {level}): {string.Join("; ", parts)}";
+        }
+
+        string AsIsLine(ImageFinding f) =>
+            $"\n    {f.RelPath}  ({Size(f.Length)})" + (f.Removable.Count > 0 ? ": carries " + string.Join(", ", f.Removable.Select(Lower)) : "");
+
+        long total = work.Sum(f => f.Saving);
+        var lists = (work.Count > 0 ? "\n  To do:" + string.Concat(work.Select(Line)) : "")
+                    + (asIs.Count > 0 ? "\n  Kept as they are (As is):" + string.Concat(asIs.Select(AsIsLine)) : "")
+                    + (problems.Count > 0 ? "\n  Not readable:" + string.Concat(problems.Select(f => $"\n    {f.RelPath}: {f.Problem}")) : "");
+
+        if (work.Count == 0)
+        {
+            long all = images.Sum(f => f.Length);
+            r.Report(Package, rule, asIs.Count > 0 || problems.Count > 0 ? CheckStatus.Info : CheckStatus.Pass,
+                (images.Count == 1 ? "The image file meets its level." : $"All {images.Count} image files meet their level.") +
+                $" Images: {Size(all)} of {Size(facts.UnpackedSize)} unpacked ({Share(all, facts.UnpackedSize)})." + lists);
+            return;
+        }
+
+        // Metadata always counts: it's about what the files tell, not their size. A saving counts when
+        // it matters for this repo: 1 % of the packed zip (unpacked for a folder snapshot).
+        bool metadata = work.Any(f => f.Removable.Count > 0);
+        long repo = facts.PackedSize ?? facts.UnpackedSize;
+        bool worthIt = repo > 0 && total >= repo * ImageSavingRepoShare;
+        long imageBytes = images.Sum(f => f.Length);
+        var sizes = $" Images: {Size(imageBytes)} of {Size(facts.UnpackedSize)} unpacked ({Share(imageBytes, facts.UnpackedSize)})." +
+                    (total > 0
+                        ? facts.PackedSize is { } packed
+                            ? $" The saving is {Share(total, packed)} of the packed zip ({Size(packed)})."
+                            : $" The saving is {Share(total, facts.UnpackedSize)} of the files."
+                        : "");
+        var status = metadata || worthIt ? CheckStatus.Artwork : CheckStatus.Info;
+        var note = status == CheckStatus.Info ? " Only a small share of this repo, so it's noted, not flagged." : "";
+
+        var head = $"{work.Count} of {Plural(images.Count, "image file")} don't meet their level yet: metadata nothing displays, " +
+                   "or a saving without loss" + (total > 0 ? $" (about {Size(total)} in all)" : "") + "." + sizes + note;
+        if (!s.IsZip)
+        {
+            r.Report(Package, rule, status, "Folder snapshot; " + char.ToLowerInvariant(head[0]) + head[1..] + lists);
+            return;
+        }
+        r.Report(Package, rule, status,
+            head + " The fix shows each file and its level; nothing changes in a file you don't tick." + lists,
+            FixKind.OptimiseImages);
+    }
+
+    /// <summary>The zip's size on disk, or null for a folder snapshot (or a zip that can't be looked at).</summary>
+    private static long? SnapshotSize(RepoSnapshot s)
+    {
+        if (!s.IsZip) return null;
+        try { return new FileInfo(s.SourcePath).Length; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { return null; }
+    }
+
+    /// <summary>A lossless saving smaller than this share of the packed repo is noted, not flagged.</summary>
+    public const double ImageSavingRepoShare = 0.01;
+
+    private static string LevelWord(ImageKit.ImageLevel level) => level switch
+    {
+        ImageKit.ImageLevel.AsIs => "As is",
+        ImageKit.ImageLevel.Strip => "Strip",
+        ImageKit.ImageLevel.Lossless => "Lossless",
+        _ => "Smallest"
+    };
+
+    private static string Lower(string name) =>
+        name.Length > 1 && char.IsUpper(name[0]) && char.IsLower(name[1]) ? char.ToLowerInvariant(name[0]) + name[1..] : name;
 
     /// <summary>
     /// Your private notes (the names in Settings) are recognised for what they are: never a defect,
@@ -418,7 +639,7 @@ public static class StandardsRules
 
     // ================= Project =================
 
-    private static (ProjectModel? Main, List<ProjectModel> Tests) ProjectRules(RepoSnapshot s, List<CheckResult> r)
+    private static (ProjectModel? Main, List<ProjectModel> Tests) ProjectRules(RepoSnapshot s, List<CheckResult> r, bool linux)
     {
         const string fileRule = "Project file";
         var (selected, apps, tests) = SelectProjects(s);
@@ -484,19 +705,27 @@ public static class StandardsRules
         const string tfmRule = "Target framework";
         var tfm = main.Prop("TargetFramework");
         var tfms = main.Prop("TargetFrameworks");
-        var minimum = Core.Standard.Current.MinimumTargetFramework;
+        var minimum = Core.Standard.Current.MinimumTargetFrameworkFor(linux ? AppPlatform.Linux : AppPlatform.Windows);
         var wanted = Core.Standard.ParseTargetFramework(minimum);
         var found = Core.Standard.ParseTargetFramework(tfm);
+        // A Linux app's framework carries no platform at all: net10.0-windows can't be built for Linux.
         bool meets = wanted is { } w && found is { } f && f.Version >= w.Version
-                     && (w.Platform.Length == 0 || f.Platform == w.Platform);
+                     && (linux ? f.Platform.Length == 0 : w.Platform.Length == 0 || f.Platform == w.Platform);
         if (tfm is not null && meets)
             r.Report(Project, tfmRule, CheckStatus.Pass, tfm);
         else if (tfm is null && tfms is not null)
             r.Report(Project, tfmRule, CheckStatus.Warn, $"Multi-targets {tfms}. Expected a single {minimum} or newer.");
+        else if (linux && found is { Platform.Length: > 0 } platformed)
+            r.Report(Project, tfmRule, CheckStatus.Fail,
+                $"Found {tfm}. A Linux app targets {minimum} or newer without a platform: a -{platformed.Platform} framework can't be built for Linux.");
+        else if (linux)
+            r.Report(Project, tfmRule, CheckStatus.Fail, $"Found {tfm ?? "nothing"}. Expected {minimum} or newer, without -windows.");
         else
             r.Report(Project, tfmRule, CheckStatus.Fail, $"Found {tfm ?? "nothing"}. Expected {minimum} or newer.");
 
-        if (main.IsTrue("UseWPF"))
+        if (linux)
+            AvaloniaRule(main, r);
+        else if (main.IsTrue("UseWPF"))
             r.Report(Project, "WPF", CheckStatus.Pass, "UseWPF is true.");
         else
             r.Report(Project, "WPF", CheckStatus.Fail, "UseWPF isn't set to true.");
@@ -504,12 +733,40 @@ public static class StandardsRules
         var outputType = main.Prop("OutputType");
         if (string.Equals(outputType, "WinExe", StringComparison.OrdinalIgnoreCase))
             r.Report(Project, "Output type", CheckStatus.Pass, "WinExe");
+        else if (linux && string.Equals(outputType, "Exe", StringComparison.OrdinalIgnoreCase))
+            r.Report(Project, "Output type", CheckStatus.Pass, "Exe, which on Linux is the same as WinExe: there is no console window to open.");
         else if (string.Equals(outputType, "Exe", StringComparison.OrdinalIgnoreCase))
             r.Report(Project, "Output type", CheckStatus.Warn, "Exe opens a console window next to the app. Expected WinExe.");
         else
             r.Report(Project, "Output type", CheckStatus.Fail, $"Found {outputType ?? "nothing"}. Expected WinExe.");
 
         return (main, tests);
+    }
+
+    /// <summary>The package every Avalonia app references; the others (backends, themes) come on top of it.</summary>
+    public const string AvaloniaPackage = "Avalonia";
+
+    /// <summary>
+    /// A Linux app's window is written with Avalonia, which takes the place WPF has on Windows: the app
+    /// project references the Avalonia package and sets neither UseWPF nor UseWindowsForms.
+    /// </summary>
+    private static void AvaloniaRule(ProjectModel main, List<CheckResult> r)
+    {
+        const string rule = "Avalonia";
+        var reference = main.Items.FirstOrDefault(i => i.Type == "PackageReference" && i.Mode != ItemMode.Remove
+                                                       && i.Include.Equals(AvaloniaPackage, StringComparison.OrdinalIgnoreCase));
+        var windowsToolkits = new[] { "UseWPF", "UseWindowsForms" }.Where(main.IsTrue).ToList();
+
+        if (reference is not null && windowsToolkits.Count == 0)
+            r.Report(Project, rule, CheckStatus.Pass, $"References {Describe(reference)}; no UseWPF or UseWindowsForms.");
+        else if (reference is null)
+            r.Report(Project, rule, CheckStatus.Fail,
+                $"{main.RelPath} doesn't reference the {AvaloniaPackage} package" +
+                (windowsToolkits.Count > 0 ? $" and sets {string.Join(" and ", windowsToolkits)}" : "") +
+                ". A Linux app's window is written with Avalonia.");
+        else
+            r.Report(Project, rule, CheckStatus.Fail,
+                $"References {Describe(reference)}, but also sets {string.Join(" and ", windowsToolkits)}, which only exist on Windows.");
     }
 
     /// <summary>
@@ -711,18 +968,23 @@ public static class StandardsRules
     /// one row. RepoBuilder passes them on the command line today, but a batch that mixes projects
     /// with different publish intents can't, so the .csproj has to carry them.
     /// </summary>
-    private static void PublishRules(RepoSnapshot s, ProjectModel p, List<CheckResult> r)
+    private static void PublishRules(RepoSnapshot s, ProjectModel p, List<CheckResult> r, AppSystem system)
     {
         const string rule = "Publish settings";
+        bool linux = system.Platform == AppPlatform.Linux;
+        var properties = Core.Standard.Current.PublishPropertiesFor(system.Platform);
+        var prefix = Core.Standard.RuntimePrefix(system.Platform);
 
         var missing = new List<string>();
         var notes = new List<string>();
         bool fixable = false;
 
-        foreach (var (property, expected) in FixCatalog.PublishProperties)
+        foreach (var (property, expected) in properties)
         {
             var value = p.Prop(property);
-            if (value is not null && Matches(property, value, expected)) continue;
+            // A runtime for the other system is the System row's failure; it isn't reported a second time here.
+            if (property == "RuntimeIdentifier" && system.RuntimeReported) continue;
+            if (value is not null && Matches(property, value, expected, prefix)) continue;
 
             missing.Add(value is null ? $"{property} isn't set" : $"{property} is {value}");
 
@@ -738,11 +1000,16 @@ public static class StandardsRules
 
         if (missing.Count == 0)
         {
-            r.Report(Publish, rule, CheckStatus.Pass, "All five set: win-x64, self-contained, single file, native libraries bundled, compressed.");
+            r.Report(Publish, rule, CheckStatus.Pass,
+                system.RuntimeReported
+                    ? "Four of five checked here and set: self-contained, single file, native libraries bundled, compressed. The runtime is reported under System."
+                    : linux
+                        ? $"All five set: {p.Prop("RuntimeIdentifier")}, self-contained, single file, native libraries bundled, compressed."
+                        : "All five set: win-x64, self-contained, single file, native libraries bundled, compressed.");
             return;
         }
 
-        var detail = $"{FixCatalog.PublishProperties.Length - missing.Count} of {FixCatalog.PublishProperties.Length} set. " +
+        var detail = $"{properties.Length - missing.Count} of {properties.Length} set. " +
                      $"Missing: {string.Join("; ", missing)}. " +
                      "RepoBuilder passes these at publish time, but a batch with mixed publish intents can't, so the .csproj needs them.";
         if (notes.Count > 0) detail += " " + string.Join(" ", notes);
@@ -750,9 +1017,9 @@ public static class StandardsRules
         r.Report(Publish, rule, CheckStatus.Fail, detail, fixable ? FixKind.PublishSettings : FixKind.None);
     }
 
-    private static bool Matches(string property, string value, string expected) =>
+    private static bool Matches(string property, string value, string expected, string runtimePrefix) =>
         property == "RuntimeIdentifier"
-            ? value.StartsWith("win-", StringComparison.OrdinalIgnoreCase)
+            ? value.StartsWith(runtimePrefix, StringComparison.OrdinalIgnoreCase)
             : value.Equals(expected, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>True when the property can be set safely in the app's own .csproj.</summary>
@@ -782,7 +1049,7 @@ public static class StandardsRules
 
     // ================= Icon and header =================
 
-    private static void IconRules(RepoSnapshot s, IReadOnlyList<SnapshotFile> files, ProjectModel p, List<CheckResult> r)
+    private static void IconRules(RepoSnapshot s, IReadOnlyList<SnapshotFile> files, ProjectModel p, List<CheckResult> r, bool linux)
     {
         // Exe icon wiring
         var icon = p.Prop("ApplicationIcon");
@@ -820,7 +1087,32 @@ public static class StandardsRules
         var other = pngItems.FirstOrDefault();
 
         const string resourceRule = "Header image resource";
-        if (resource is not null)
+        bool ReadInCode() => files.Any(f => f.Extension == ".cs" && f.Text is not null
+                                            && CSharpLexer.BlankCommentsAndStrings(f.Text).Contains("GetManifestResourceStream", StringComparison.Ordinal));
+        if (linux)
+        {
+            // Avalonia compiles an AvaloniaResource into the assembly (avares:// and "/app_256.png" find it there);
+            // an EmbeddedResource read back in code works just as well. WPF's <Resource> does nothing here.
+            var avalonia = pngItems.FirstOrDefault(i => i.Type == "AvaloniaResource");
+            if (avalonia is not null)
+                r.Report(Icons, resourceRule, CheckStatus.Pass, $"Included as <AvaloniaResource Include=\"{avalonia.Include}\" />.");
+            else if (embedded is not null && ReadInCode())
+                r.Report(Icons, resourceRule, CheckStatus.Pass,
+                    "Included as EmbeddedResource and read with GetManifestResourceStream.");
+            else if (embedded is not null)
+                r.Report(Icons, resourceRule, CheckStatus.Warn,
+                    "Included as EmbeddedResource, but no code reads it with GetManifestResourceStream, and Avalonia's own paths (avares://, \"/app_256.png\") need an <AvaloniaResource> item.");
+            else if (resource is not null)
+                r.Report(Icons, resourceRule, CheckStatus.Warn,
+                    "Included as <Resource>, which is WPF's item and does nothing in an Avalonia build. Use <AvaloniaResource>, or EmbeddedResource read with GetManifestResourceStream.");
+            else if (other is not null)
+                r.Report(Icons, resourceRule, CheckStatus.Warn,
+                    $"Included as {other.Type}. Use <AvaloniaResource> so it's compiled into the program.");
+            else
+                r.Report(Icons, resourceRule, CheckStatus.Fail,
+                    $"{HeaderImageName} isn't included as an <AvaloniaResource> or EmbeddedResource item.");
+        }
+        else if (resource is not null)
             r.Report(Icons, resourceRule, CheckStatus.Pass, $"Included as <Resource Include=\"{resource.Include}\" />.");
         else if (embedded is not null && files.Any(f => f.Extension == ".cs" && f.Text is not null
                      && CSharpLexer.BlankCommentsAndStrings(f.Text).Contains("GetManifestResourceStream", StringComparison.Ordinal)))
@@ -914,14 +1206,16 @@ public static class StandardsRules
         return new Regex("^" + pattern + "$", RegexOptions.IgnoreCase);
     }
 
-    private static void HeaderRule(IReadOnlyList<SnapshotFile> files, List<CheckResult> r)
+    private static void HeaderRule(IReadOnlyList<SnapshotFile> files, List<CheckResult> r, bool linux)
     {
         const string rule = "Header block";
+        // A Linux app's markup is Avalonia's (.axaml); the header is laid out the same way in both.
+        var markup = MarkupExtension(linux);
 
         // Comments are masked out first: a theme dictionary that only mentions app_256.png in a
         // comment isn't a header, and must not be mistaken for the file that carries one.
         var xamlRefs = files
-            .Where(f => f.Extension == ".xaml" && f.Text is not null
+            .Where(f => f.Extension == markup && f.Text is not null
                         && XmlComment.Replace(f.Text, "").Contains(HeaderImageName, StringComparison.OrdinalIgnoreCase))
             .ToList();
 
@@ -940,13 +1234,20 @@ public static class StandardsRules
                 if (scan is { TextLines: >= 2 })
                     r.Report(Icons, rule, CheckStatus.Pass,
                         $"Image with name and description built in code in {where}.");
+                else if (NamedXamlHeader(files, code, markup) is { } xaml)
+                    // The image is only loaded in code, into an <Image x:Name="…"> that the XAML lays out
+                    // with its text: AppIcon.Source = bitmap.
+                    r.Report(Icons, rule, CheckStatus.Pass,
+                        $"Image with name and description in {xaml}; the image is loaded in {where}.");
                 else
                     r.Report(Icons, rule, CheckStatus.Info,
                         $"{HeaderImageName} is loaded in {where}, but the text beside it couldn't be confirmed " +
                         $"({Plural(scan?.TextLines ?? 0, "text line")} found there). Check it by eye.");
             }
             else
-                r.Report(Icons, rule, CheckStatus.Fail, $"No XAML references {HeaderImageName}, so there's no header image.");
+                r.Report(Icons, rule, CheckStatus.Fail, linux
+                    ? $"No .axaml file and no code references {HeaderImageName}, so there's no header image."
+                    : $"No XAML references {HeaderImageName}, so there's no header image.");
             return;
         }
 
@@ -997,6 +1298,39 @@ public static class StandardsRules
                 $"The header image in {best.Name} has {Plural(bestLines, "text line")} beside it. Expected the app name and a description.");
     }
 
+    private static readonly Regex SourceAssignment = new(@"\b(?<name>[A-Za-z_]\w*)\s*\.\s*Source\s*=(?!=)", RegexOptions.Compiled);
+
+    /// <summary>
+    /// The XAML file whose named Image the code fills (AppIcon.Source = …) and that has the app name and a
+    /// description beside it, counted as for a header laid out in XAML; null when there's none.
+    /// </summary>
+    private static string? NamedXamlHeader(IReadOnlyList<SnapshotFile> files, SnapshotFile code, string markup)
+    {
+        var names = SourceAssignment.Matches(CSharpLexer.BlankCommentsAndStrings(code.Text!))
+            .Select(m => m.Groups["name"].Value)
+            .ToHashSet(StringComparer.Ordinal);
+        if (names.Count == 0) return null;
+
+        foreach (var file in files.Where(f => f.Extension == markup && f.Text is not null))
+        {
+            var doc = TryParse(file);
+            if (doc is null) continue;
+            var image = doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "Image"
+                && e.Attributes().Any(a => a.Name.LocalName == "Name" && names.Contains(a.Value)));
+            if (image is null) continue;
+
+            int lines = 0;
+            var container = image.Parent;
+            for (int up = 0; container is not null && up < HeaderClimb && lines < 2; up++, container = container.Parent)
+                lines = Math.Max(lines, CountTextLines(container));
+            if (lines >= 2) return file.RelPath;
+        }
+        return null;
+    }
+
+    /// <summary>The markup files of an app: WPF's .xaml, or Avalonia's .axaml for a Linux app.</summary>
+    private static string MarkupExtension(bool linux) => linux ? ".axaml" : ".xaml";
+
     private static bool References(XElement element) =>
         element.Attributes().Any(a => a.Value.Contains(HeaderImageName, StringComparison.OrdinalIgnoreCase))
         || (!element.HasElements && element.Value.Contains(HeaderImageName, StringComparison.OrdinalIgnoreCase));
@@ -1033,9 +1367,16 @@ public static class StandardsRules
 
     // ================= Dark mode =================
 
-    private static void DarkTitleBarRule(IReadOnlyList<SnapshotFile> files, List<CheckResult> r)
+    private static void DarkTitleBarRule(IReadOnlyList<SnapshotFile> files, List<CheckResult> r, bool linux)
     {
         const string rule = "Dark title bar";
+        if (linux)
+        {
+            r.Add(new CheckResult(Dark, rule, CheckStatus.Info,
+                "Linux: the desktop (KDE, GNOME) draws the title bar, in its own theme's colours; an app cannot colour it. " +
+                "What an app can do is checked under Dark theme.") { NotApplicable = true });
+            return;
+        }
         // Comments blanked, strings kept: a commented-out call doesn't count, and the name can be in a
         // string (EntryPoint = "DwmSetWindowAttribute").
         var calls = files
@@ -1058,12 +1399,61 @@ public static class StandardsRules
                 $"DwmSetWindowAttribute is called in {calls[0].File.Name}, but not with the dark mode attribute (19 or 20).");
     }
 
-    private static void DarkBackgroundRule(IReadOnlyList<SnapshotFile> files, List<CheckResult> r)
+    private static readonly Regex ThemeVariantInCode = new(
+        @"\bRequestedThemeVariant\s*=\s*(?:[\w.]+\.)?ThemeVariant\s*\.\s*(?<variant>\w+)", RegexOptions.Compiled);
+
+    /// <summary>
+    /// A Linux app's dark mode: Avalonia's theme variant set to dark, on the Application element in markup
+    /// (RequestedThemeVariant="Dark") or in code (RequestedThemeVariant = ThemeVariant.Dark). Without it the
+    /// app follows the desktop's setting and can come up light.
+    /// </summary>
+    private static void DarkThemeRule(IReadOnlyList<SnapshotFile> files, List<CheckResult> r)
+    {
+        const string rule = "Dark theme";
+        var set = new List<(string Variant, string Where)>();
+
+        foreach (var file in files.Where(f => f.Extension == ".axaml" && f.Text is not null))
+        {
+            var root = TryParse(file)?.Root;
+            // The variant counts on the Application; a window or control asking for its own is a local matter.
+            if (root is null || root.Name.LocalName != "Application") continue;
+            if (root.Attribute("RequestedThemeVariant")?.Value.Trim() is { Length: > 0 } variant)
+                set.Add((variant, file.RelPath));
+        }
+
+        foreach (var file in files.Where(f => f.Extension == ".cs" && f.Text is not null))
+        {
+            var code = CSharpLexer.BlankCommentsAndStrings(file.Text!);
+            foreach (Match match in ThemeVariantInCode.Matches(code))
+            {
+                int line = code[..match.Index].Count(c => c == '\n') + 1;
+                set.Add((match.Groups["variant"].Value, $"{file.RelPath} line {line}"));
+            }
+        }
+
+        var dark = set.Where(x => x.Variant.Equals("Dark", StringComparison.OrdinalIgnoreCase)).ToList();
+        var other = set.Where(x => !x.Variant.Equals("Dark", StringComparison.OrdinalIgnoreCase)).ToList();
+
+        if (dark.Count > 0 && other.Count == 0)
+            r.Report(Dark, rule, CheckStatus.Pass, $"The theme variant is set to Dark in {dark[0].Where}.");
+        else if (dark.Count > 0)
+            r.Report(Dark, rule, CheckStatus.Warn,
+                $"The theme variant is set to Dark in {dark[0].Where}, but also to {other[0].Variant} in {other[0].Where}. Check which one the app ends up with.");
+        else if (other.Count > 0)
+            r.Report(Dark, rule, CheckStatus.Fail,
+                $"The theme variant is set to {other[0].Variant} in {other[0].Where}. Expected Dark.");
+        else
+            r.Report(Dark, rule, CheckStatus.Fail,
+                "The Avalonia theme variant isn't set to dark: no RequestedThemeVariant=\"Dark\" on the Application in App.axaml and no " +
+                "RequestedThemeVariant = ThemeVariant.Dark in code. Without it the app follows the desktop and can come up light.");
+    }
+
+    private static void DarkBackgroundRule(IReadOnlyList<SnapshotFile> files, List<CheckResult> r, bool linux)
     {
         const string rule = "Dark window background";
 
         var docs = files
-            .Where(f => f.Extension == ".xaml" && f.Text is not null)
+            .Where(f => f.Extension == MarkupExtension(linux) && f.Text is not null)
             .Select(f => (File: f, Doc: TryParse(f)))
             .Where(x => x.Doc?.Root is not null)
             .Select(x => (x.File, Doc: x.Doc!))
@@ -1081,7 +1471,9 @@ public static class StandardsRules
         XElement? styleElement = null;
         foreach (var (_, doc) in docs)
         {
-            foreach (var style in doc.Descendants().Where(e => e.Name.LocalName == "Style" && IsWindowType(e.Attribute("TargetType")?.Value)))
+            // WPF: <Style TargetType="Window">. Avalonia: <Style Selector="Window">.
+            foreach (var style in doc.Descendants().Where(e => e.Name.LocalName == "Style"
+                         && (IsWindowType(e.Attribute("TargetType")?.Value) || linux && e.Attribute("Selector")?.Value.Trim() == "Window")))
             {
                 var setter = style.Elements().FirstOrDefault(e =>
                     e.Name.LocalName == "Setter" && e.Attribute("Property")?.Value == "Background");
@@ -1104,7 +1496,7 @@ public static class StandardsRules
                 r.Report(Dark, rule, CheckStatus.Info,
                     $"Windows are built in code ({codeWindow.Name}), so their background colour isn't checked.");
             else
-                r.Report(Dark, rule, CheckStatus.Warn, "No window XAML found to check.");
+                r.Report(Dark, rule, CheckStatus.Warn, linux ? "No window .axaml found to check." : "No window XAML found to check.");
             return;
         }
 
@@ -1125,6 +1517,11 @@ public static class StandardsRules
                 color = ResolveColor(attribute.Value, resources, 0);
             else if (propertyElement?.Elements().FirstOrDefault() is { } inner)
                 color = ResolveElement(inner, resources, 0);
+            else if (linux && ThemeBackground(root, resources) is { } themed)
+                // Avalonia: the window's look is a ControlTheme, applied with Theme="{StaticResource Hue.Window}".
+                color = themed.Value is not null
+                    ? ResolveColor(themed.Value, resources, 0)
+                    : themed.Element is not null ? ResolveElement(themed.Element, resources, 0) : null;
             else if (styleValue is not null)
                 color = ResolveColor(styleValue, resources, 0);
             else if (styleElement is not null)
@@ -1139,6 +1536,17 @@ public static class StandardsRules
             else if (color is null || color.Value.A < 128) unresolved.Add(file.Name);
             else if (Luminance(color.Value) >= 0.35) light.Add($"{file.Name} ({Hex(color.Value)})");
         }
+
+        // Avalonia's dark theme variant gives a window without a background of its own a dark one, where WPF
+        // gives it white: on Linux that is the Dark theme row's matter, not a failure here.
+        if (linux && light.Count == 0 && unresolved.Count == 0 && missing.Count > 0)
+        {
+            r.Report(Dark, rule, CheckStatus.Pass, missing.Count == windows.Count
+                ? $"{(windows.Count == 1 ? windows[0].File.Name + " sets" : $"The {windows.Count} windows set")} no background of their own, so they take the theme's: dark, as long as the theme variant is (see Dark theme)."
+                : $"{Sample(missing)} set no background of their own and take the theme's (see Dark theme); the other windows have dark backgrounds.");
+            return;
+        }
+        if (linux) missing.Clear();
 
         if (light.Count > 0 || missing.Count > 0)
         {
@@ -1157,6 +1565,26 @@ public static class StandardsRules
             r.Report(Dark, rule, CheckStatus.Pass,
                 windows.Count == 1 ? $"{windows[0].File.Name} has a dark background." : $"All {windows.Count} windows have dark backgrounds.");
         }
+    }
+
+    /// <summary>
+    /// The Background setter of the ControlTheme an Avalonia window names with Theme="{StaticResource Key}":
+    /// its Value attribute, or the element inside a Setter.Value. Null when the window names no theme, the
+    /// theme isn't in the repo, or it sets no background.
+    /// </summary>
+    private static (string? Value, XElement? Element)? ThemeBackground(XElement window, Dictionary<string, XElement> resources)
+    {
+        var reference = window.Attribute("Theme")?.Value;
+        if (reference is null) return null;
+        var match = ResourceReference.Match(reference.Trim());
+        if (!match.Success || !resources.TryGetValue(match.Groups["key"].Value, out var theme)) return null;
+        if (theme.Name.LocalName != "ControlTheme") return null;
+
+        var setter = theme.Elements().FirstOrDefault(e =>
+            e.Name.LocalName == "Setter" && e.Attribute("Property")?.Value == "Background");
+        if (setter is null) return null;
+        return (setter.Attribute("Value")?.Value,
+                setter.Elements().FirstOrDefault(e => e.Name.LocalName == "Setter.Value")?.Elements().FirstOrDefault());
     }
 
     private static bool IsWindowType(string? targetType) =>
@@ -1250,8 +1678,10 @@ public static class StandardsRules
     }
 
     private static void DependencyRules(RepoSnapshot s, ProjectModel p, List<ProjectModel> shipped, List<ProjectModel> tests,
-                                        List<CheckResult> r, ScanFacts facts)
+                                        List<CheckResult> r, ScanFacts facts, AppPlatform platform)
     {
+        bool linux = platform == AppPlatform.Linux;
+        var standard = Core.Standard.Current;
         // A package from a library is named with the project it comes from.
         string ProjectName(ProjectModel m) => Path.GetFileNameWithoutExtension(m.RelPath);
         var packages = shipped
@@ -1273,14 +1703,25 @@ public static class StandardsRules
         var allowed = new List<(ProjectItem Item, string? From)>();
         var outdated = new List<string>();
         var blocked = new List<string>();
+        // A Linux app must not use these at all, approved or not: Avalonia.Desktop brings the other systems' backends.
+        var forbidden = new List<string>();
+        var reasons = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var package in packages)
         {
             var (item, from) = package;
-            if (!AllowedPackages.TryGetValue(item.Include, out var rule))
+            var rule = standard.ApprovedFor(platform, item.Include, out string list);
+            if (linux && standard.LinuxForbiddenPackages.Contains(item.Include, StringComparer.OrdinalIgnoreCase))
+            {
+                var why = Core.Standard.ForbiddenReason(item.Include);
+                forbidden.Add($"{Describe(package)}: {why}");
+                facts.PackageUses.Add(new PackageUse(item.Include, item.Version, PackageUseState.NotListed, "not to be used in a Linux app" + Where(from)));
+            }
+            else if (rule is null)
             {
                 blocked.Add(Describe(package));
-                facts.PackageUses.Add(new PackageUse(item.Include, item.Version, PackageUseState.NotListed, "not on the approved list" + Where(from)));
+                facts.PackageUses.Add(new PackageUse(item.Include, item.Version, PackageUseState.NotListed,
+                    (linux ? "not on the approved lists" : "not on the approved list") + Where(from)));
             }
             else if (IsOlderThan(item.Version, rule.MinVersion))
             {
@@ -1290,29 +1731,38 @@ public static class StandardsRules
             else
             {
                 allowed.Add(package);
-                facts.PackageUses.Add(new PackageUse(item.Include, item.Version, PackageUseState.Ok, $"approved from {rule.MinVersion}" + Where(from)));
+                reasons[item.Include] = rule.Reason;
+                facts.PackageUses.Add(new PackageUse(item.Include, item.Version, PackageUseState.Ok,
+                    $"approved from {rule.MinVersion} ({list} list)" + Where(from)));
             }
         }
 
         var allowedText = string.Join("; ", allowed.Select(x =>
-            $"{(x.Item.Version is null ? x.Item.Include + " (version not set in the project)" : Describe(x))} ({AllowedPackages[x.Item.Include].Reason})"));
+            $"{(x.Item.Version is null ? x.Item.Include + " (version not set in the project)" : Describe(x))} ({reasons[x.Item.Include]})"));
 
         facts.Packages = packages.Count == 0 && !packagesConfig ? PackageState.None
-            : blocked.Count == 0 && outdated.Count == 0 && !packagesConfig ? PackageState.Allowed
+            : blocked.Count == 0 && outdated.Count == 0 && forbidden.Count == 0 && !packagesConfig ? PackageState.Allowed
             : PackageState.Foreign;
 
         if (packages.Count == 0 && !packagesConfig)
         {
             r.Report(Deps, packageRule, CheckStatus.Pass, "None: the app is all your own code plus the framework.");
         }
-        else if (blocked.Count == 0 && outdated.Count == 0 && !packagesConfig)
+        else if (blocked.Count == 0 && outdated.Count == 0 && forbidden.Count == 0 && !packagesConfig)
         {
             r.Report(Deps, packageRule, CheckStatus.Info,
-                $"On the approved list and current enough: {allowedText}. Watch these for security advisories.");
+                (linux ? "On the approved lists (Hybrid and Linux) and current enough: "
+                       : "On the approved list and current enough: ")
+                + $"{allowedText}. Watch these for security advisories.");
         }
         else
         {
-            var detail = blocked.Count > 0 ? "Not on the approved list: " + Sample(blocked) + "." + EmptyListNote : "";
+            var detail = forbidden.Count > 0 ? "Not to be used in a Linux app: " + string.Join("; ", forbidden) + "." : "";
+            if (blocked.Count > 0)
+                detail += linux
+                    ? " Not on the approved lists (Hybrid and Linux): " + Sample(blocked, 8) + "."
+                      + (standard.LinuxApprovedPackages.Count == 0 ? " No Linux packages are approved yet: add them in Settings, under Linux: approved packages." : "")
+                    : "Not on the approved list: " + Sample(blocked) + "." + EmptyListNote(platform);
             if (outdated.Count > 0) detail += " Older than the approved minimum: " + string.Join("; ", outdated) + ".";
             if (packagesConfig) detail += " A packages.config file is present.";
             if (allowed.Count > 0) detail += $" Allowed as well: {allowedText}.";
@@ -1369,11 +1819,189 @@ public static class StandardsRules
     private static string Describe(ProjectItem package) =>
         package.Version is null ? package.Include : $"{package.Include} {package.Version}";
 
+    /// <summary>
+    /// The Avalonia packages of everything that ships are on one version: the framework, its backends and
+    /// its theme are released together and mixing versions breaks at run time, not at build time. Packages
+    /// with a version line of their own (the data grid, since Avalonia 12) are a setting and left out.
+    /// </summary>
+    private static void AvaloniaVersionRule(List<ProjectModel> shipped, List<CheckResult> r)
+    {
+        const string rule = "Avalonia packages on one version";
+        var own = Core.Standard.Current.LinuxOwnVersionPackages;
+
+        var avalonia = shipped.SelectMany(m => m.Items)
+            .Where(i => i.Type == "PackageReference" && i.Mode != ItemMode.Remove
+                        && (i.Include.Equals(AvaloniaPackage, StringComparison.OrdinalIgnoreCase)
+                            || i.Include.StartsWith(AvaloniaPackage + ".", StringComparison.OrdinalIgnoreCase)))
+            .GroupBy(i => (i.Include.ToLowerInvariant(), i.Version))
+            .Select(g => g.First())
+            .ToList();
+        if (avalonia.Count == 0) return;   // the Avalonia row already says there is no reference
+
+        var apart = avalonia.Where(i => own.Contains(i.Include, StringComparer.OrdinalIgnoreCase)).ToList();
+        var together = avalonia.Except(apart).ToList();
+        var apartNote = apart.Count == 0 ? ""
+            : $" {string.Join(" and ", apart.Select(Describe))} {(apart.Count == 1 ? "has a version line of its own" : "have version lines of their own")}.";
+
+        var unset = together.Where(i => i.Version is null).ToList();
+        var versions = together.Where(i => i.Version is not null).GroupBy(i => i.Version!, StringComparer.OrdinalIgnoreCase).ToList();
+
+        if (versions.Count > 1)
+            r.Report(Deps, rule, CheckStatus.Fail,
+                "The Avalonia packages are on different versions: " +
+                string.Join("; ", versions.OrderBy(v => v.Key, StringComparer.OrdinalIgnoreCase)
+                    .Select(v => $"{v.Key} ({string.Join(", ", v.Select(i => i.Include))})")) +
+                ". They are released together and belong on one version." + apartNote);
+        else if (unset.Count > 0)
+            r.Report(Deps, rule, CheckStatus.Info,
+                $"The version of {Sample(unset.Select(i => i.Include))} isn't set in the project, so it can't be compared." + apartNote);
+        else if (versions.Count == 1)
+            r.Report(Deps, rule, CheckStatus.Pass,
+                $"{(together.Count == 1 ? "The one Avalonia package is" : $"All {together.Count} Avalonia packages are")} on {versions[0].Key}." + apartNote);
+        else
+            r.Report(Deps, rule, CheckStatus.Info, "Only packages with a version line of their own." + apartNote);
+    }
+
+    // ================= Linux only =================
+
+    /// <summary>
+    /// Two things a Linux app of this suite does because a Linux program file can't: it answers --version
+    /// (a file manager shows no version for it), and it says "for Linux" in its name, so a screenshot isn't
+    /// taken for the Windows edition's. Both are read from the source and warn when they aren't found: what
+    /// the check can't see it doesn't call a failure. The rows are filed with the project rules.
+    /// </summary>
+    private static void LinuxProgramRules(RepoSnapshot s, IReadOnlyList<SnapshotFile> files, IReadOnlyList<SnapshotFile> code,
+                                          ProjectModel project, List<CheckResult> r)
+    {
+        var rows = new List<CheckResult>();
+        var assembly = AssemblyOf(project);
+
+        const string versionRule = "Answers --version";
+        var handled = VersionSwitch(code);
+        rows.Add(handled is not null
+            ? new CheckResult(Project, versionRule, CheckStatus.Pass, $"The --version argument is handled in {handled}.")
+            : new CheckResult(Project, versionRule, CheckStatus.Warn,
+                "No handling of a --version argument was found. A Linux program file carries no version a file manager could show, " +
+                "so the suite's programs answer --version before the window starts, with their name, version and the SHA-256 of their own file. " +
+                "If it is handled in a way the check can't see, exempt this rule with the reason."));
+
+        const string nameRule = "Name says Linux";
+        var named = LinuxName(files, code);
+        rows.Add(named is not null
+            ? new CheckResult(Project, nameRule, CheckStatus.Pass, $"{named}. The program file and the assembly keep the plain name.")
+            : new CheckResult(Project, nameRule, CheckStatus.Warn,
+                $"Neither a window title nor a text in the code says \"{(assembly.Length == 0 ? "<App>" : assembly)} for Linux\". The window title, the header and --version " +
+                "say it, so that a screenshot or a document can't be taken for the Windows edition's; the program file and the assembly keep the plain name. " +
+                "Only the window title and text constants are read: the header and the --version output aren't checked one by one."));
+
+        // Filed with the other project rows, so the categories stay in one piece each.
+        int at = r.FindLastIndex(x => x.Category == Project) + 1;
+        r.InsertRange(at, rows);
+    }
+
+    private static readonly Regex ComparedBefore = new(@"(?:\bcase|\bis|\bor|==|!=|\bEquals\s*\(|\bContains\s*\()\s*$", RegexOptions.Compiled);
+    private static readonly Regex ArgsWord = new(@"\bargs\b", RegexOptions.Compiled);
+
+    /// <summary>
+    /// Where the code compares an argument with "--version": the literal in a statement that names args, or
+    /// compared (is, ==, case) in a file that takes string[] args. Handing "--version" to another program
+    /// (dotnet --version) is not handling it. "File.cs line 12", or null.
+    /// </summary>
+    private static string? VersionSwitch(IReadOnlyList<SnapshotFile> code)
+    {
+        foreach (var file in code.Where(f => f.Extension == ".cs" && f.Text is not null && f.Text.Contains("--version", StringComparison.Ordinal)))
+        {
+            var text = file.Text!;
+            var masked = CSharpLexer.BlankCommentsAndStrings(text);
+            bool takesArgs = Regex.IsMatch(masked, @"\bstring\s*\[\s*\]\s+args\b");
+
+            foreach (var literal in CSharpLexer.Literals(text))
+            {
+                if (literal.Text(text, " ").Trim().Trim('"') != "--version") continue;
+
+                int start = masked.LastIndexOfAny([';', '{', '}'], Math.Max(0, literal.Start - 1)) + 1;
+                int end = masked.IndexOfAny([';', '{', '}'], literal.Start);
+                var statement = masked[start..(end < 0 ? masked.Length : end)];
+                bool compared = ComparedBefore.IsMatch(masked[start..literal.Start]);
+
+                if (compared && (ArgsWord.IsMatch(statement) || takesArgs))
+                    return $"{file.RelPath} line {text[..literal.Start].Count(c => c == '\n') + 1}";
+            }
+        }
+        return null;
+    }
+
+    private static readonly Regex ForLinux = new(@"^\S.*\sfor Linux$", RegexOptions.Compiled);
+
+    /// <summary>Where the app calls itself "… for Linux": a window's Title in markup, or a text constant in the code. Null when neither does.</summary>
+    private static string? LinuxName(IReadOnlyList<SnapshotFile> files, IReadOnlyList<SnapshotFile> code)
+    {
+        foreach (var file in files.Where(f => f.Extension == ".axaml" && f.Text is not null))
+        {
+            var root = TryParse(file)?.Root;
+            if (root is null || !root.Name.LocalName.EndsWith("Window", StringComparison.Ordinal)) continue;
+            if (root.Attribute("Title")?.Value.Trim() is { } title && ForLinux.IsMatch(title))
+                return $"The window title is \"{title}\" ({file.RelPath})";
+        }
+
+        foreach (var file in code.Where(f => f.Extension == ".cs" && f.Text is not null && f.Text.Contains("for Linux", StringComparison.Ordinal)))
+        {
+            var text = file.Text!;
+            foreach (var literal in CSharpLexer.Literals(text))
+            {
+                if (literal.IsInterpolated) continue;
+                var value = literal.Text(text, " ").Trim().Trim('"');
+                if (ForLinux.IsMatch(value) && value.Length <= 80 && !value.Contains('\n'))
+                    return $"The code names the app \"{value}\" ({file.RelPath} line {text[..literal.Start].Count(c => c == '\n') + 1})";
+            }
+        }
+        return null;
+    }
+
     // ================= Security =================
 
     private static void ElevationRules(RepoSnapshot s, IReadOnlyList<SnapshotFile> files, ProjectModel p, List<ProjectModel> shipped,
-                                       List<CheckResult> r)
+                                       List<CheckResult> r, bool linux, DeclarationScan.Found found)
     {
+        // Any project that ships in the exe counts: a web package in a library runs elevated too.
+        void WebContentRow()
+        {
+            var packages = shipped.SelectMany(m => m.Items)
+                .Where(i => i.Type == "PackageReference" && i.Mode != ItemMode.Remove
+                            && WebPackages.Contains(i.Include, StringComparer.OrdinalIgnoreCase))
+                .Select(i => i.Include)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (packages.Count > 0)
+                r.Report(Security, "Web content with admin rights", CheckStatus.Warn,
+                    $"Runs elevated and uses {string.Join(" and ", packages)}, so web content is handled with admin rights.");
+        }
+
+        if (linux)
+        {
+            // A Linux program has no manifest: it runs with the user's rights unless it starts something through
+            // sudo, pkexec, doas or su. Those starts are what the check can see, and what it reports.
+            var ignored = p.Prop("ApplicationManifest") is { } unusedManifest
+                ? $" ApplicationManifest ({unusedManifest}) is set, but only Windows reads a manifest: on Linux it does nothing."
+                : "";
+            var asks = found.Of(DeclarationTopic.NeedsAdministratorRights).ToList();
+            if (asks.Count == 0)
+            {
+                r.Report(Security, ElevationRule, CheckStatus.Pass,
+                    "Linux: a program has no manifest to ask for admin rights with, and the code starts none of " +
+                    $"{string.Join(", ", DeclarationScan.LinuxElevators.Take(DeclarationScan.LinuxElevators.Count - 1))} or {DeclarationScan.LinuxElevators[^1]}, " +
+                    "so it runs with the user's normal rights." + ignored);
+                return;
+            }
+
+            var tools = asks.Select(a => a.What).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            r.Report(Security, ElevationRule, CheckStatus.Info,
+                $"Asks for admin rights by starting {string.Join(" and ", tools)} ({asks[0].File} line {asks[0].Line}). Confirm this app needs it." + ignored);
+            WebContentRow();
+            return;
+        }
+
         // Only a manifest wired up through ApplicationManifest is embedded in the exe.
         var manifestProp = p.Prop("ApplicationManifest");
         SnapshotFile? manifest = manifestProp is null ? null : s.Find(RepoSnapshot.Combine(p.Dir, manifestProp));
@@ -1410,18 +2038,226 @@ public static class StandardsRules
             ? "Always asks for admin rights (requireAdministrator)"
             : $"Asks for the highest rights the user has ({level}), which means admin rights for administrators";
         r.Report(Security, ElevationRule, CheckStatus.Info, $"{what}. Confirm this app needs it.");
+        WebContentRow();
+    }
 
-        // Any project that ships in the exe counts: a web package in a library runs elevated too.
-        var web = shipped.SelectMany(m => m.Items)
-            .Where(i => i.Type == "PackageReference" && i.Mode != ItemMode.Remove
-                        && WebPackages.Contains(i.Include, StringComparer.OrdinalIgnoreCase))
-            .Select(i => i.Include)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
+    /// <summary>The patterns of &lt;Compile Remove&gt; in a project: code it leaves out of its build.</summary>
+    private static List<Regex> CompileRemoved(ProjectModel project) => project.Items
+        .Where(i => i.Mode == ItemMode.Remove && i.Type == "Compile")
+        .SelectMany(i => i.Include.Split(';'))
+        .Select(x => x.Trim())
+        .Where(x => x.Length > 0 && !x.Contains("$(", StringComparison.Ordinal))
+        .Select(x => GlobToRegex(RepoSnapshot.Combine(project.Dir, x)))
+        .ToList();
+
+    /// <summary>
+    /// The code that ends up in the exe: every file whose nearest project is one that ships (the app and
+    /// what it references, followed down), less what that project removes from its build. Test projects
+    /// and projects nothing references don't ship.
+    /// </summary>
+    private static List<SnapshotFile> ShippedCode(RepoSnapshot s, List<ProjectModel> shipped)
+    {
+        var (_, apps, tests) = SelectProjects(s);
+        var projectDirs = apps.Concat(tests).Select(m => m.Dir).Concat(shipped.Select(m => m.Dir))
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        var removed = shipped.ToDictionary(m => m.Dir, CompileRemoved, StringComparer.OrdinalIgnoreCase);
+
+        return s.Files
+            .Where(f => f.Extension == ".cs")
+            .Where(f =>
+            {
+                var dir = RepoSnapshot.DirOf(f.RelPath);
+                var owner = projectDirs
+                    .Where(d => RepoSnapshot.IsSameOrUnder(dir, d))
+                    .OrderByDescending(d => d.Length)
+                    .FirstOrDefault();
+                return owner is not null && removed.TryGetValue(owner, out var patterns) && !patterns.Any(x => x.IsMatch(f.RelPath));
+            })
             .ToList();
+    }
 
-        if (web.Count > 0)
-            r.Report(Security, "Web content with admin rights", CheckStatus.Warn,
-                $"Runs elevated and uses {string.Join(" and ", web)}, so web content is handled with admin rights.");
+    // ================= Declared in the README =================
+
+    public const string DeclarationRuleName = "Declared in the README";
+
+    /// <summary>
+    /// Every intense thing the code does has its labelled line in the README's "What this app changes on
+    /// your system" section. One row per topic that needs attention, named "Declared in the README (Topic)"
+    /// so an exemption can cover one topic; a single Pass row when everything is in order. RepoLegibility
+    /// reads the same section.
+    /// </summary>
+    private static void DeclarationRule(RepoSnapshot s, IReadOnlyList<SnapshotFile> code, ProjectModel? project, List<WriteSite> writes,
+                                        List<CheckResult> r, bool linux, DeclarationScan.Found found)
+    {
+        var readmes = ReadmeCollector.Find(s);
+        if (readmes.Count != 1 || !ReadmeCollector.IsMarkdown(readmes[0]) || s.Find(readmes[0])?.Text is not { } readmeText)
+        {
+            r.Report(Security, DeclarationRuleName, CheckStatus.Info, "See the README rule.");
+            return;
+        }
+        var readme = readmes[0];
+
+        DeclarationScan.ScanBuild(s.Files, found);
+
+        // A write the write check traced to a machine-wide folder changes the whole computer.
+        var inScope = code.Select(f => f.RelPath).ToHashSet(StringComparer.Ordinal);
+        foreach (var w in writes.Where(w => w.Target == WriteTarget.MachineWide && inScope.Contains(w.File)))
+            found.Evidence.Add(new DeclarationScan.Evidence(DeclarationTopic.ChangesTheWholeComputer, $"{w.Call} to {w.Via}",
+                MachineKind(w.Via), w.File, w.Line));
+        // Only Windows reads an app manifest; a Linux app's request for admin rights is a start of sudo or pkexec.
+        if (!linux && project is not null && ManifestElevation(s, project) is { } elevation)
+            found.Evidence.Insert(0, elevation);
+
+        var section = DeclarationScan.ReadSection(readmeText);
+        var labels = section?.Labels ?? [];
+        var declared = labels.Where(l => l.Topic is not null).GroupBy(l => l.Topic!.Value).ToDictionary(g => g.Key, g => g.First());
+        var noSection = section is null ? $"No \"{DeclarationScan.Heading}\" section. " : "";
+
+        var rows = new List<CheckResult>();
+        var touched = new List<DeclarationScan.Topic>();
+        string? throughTool = null;
+        foreach (var topic in DeclarationScan.Topics)
+        {
+            var evidence = found.Of(topic.Id).ToList();
+            string RowName() => $"{DeclarationRuleName} ({topic.Label})";
+
+            if (evidence.Count > 0)
+            {
+                touched.Add(topic);
+                if (declared.ContainsKey(topic.Id)) continue;
+
+                var detail = $"{noSection}{topic.Label}: not declared. {Evidence(evidence)}";
+                if (topic.Id == DeclarationTopic.TalksToOtherComputers && found.Hosts.Count > 0)
+                    detail += $"\nHosts named in that code: {Sample(found.Hosts, 8)}.";
+                if (topic.Id == DeclarationTopic.StartsOtherPrograms && found.UnnamedStarts.Count > 0)
+                    detail += $"\n{UnnamedNote(found)}";
+                detail += $"\nAdd to the \"{DeclarationScan.Heading}\" section of {readme}:\n{DeclarationScan.PasteLine(topic, evidence, found.Hosts)}";
+                // The Fix writes the line above into the README, as a draft for the author to reword.
+                rows.Add(new CheckResult(Security, RowName(), topic.Fails ? CheckStatus.Fail : CheckStatus.Warn, detail)
+                    { Fix = FixKind.DeclareInReadme, FixProject = topic.Label });
+            }
+            else if (topic.Id == DeclarationTopic.TalksToOtherComputers && declared.ContainsKey(topic.Id) && found.FetchingTools.Count > 0)
+            {
+                // The app makes no network call itself, but starts a program that fetches for it (dotnet restoring
+                // packages). That bears the line out. It only ever confirms: an app that starts dotnet and declares
+                // nothing is not asked to.
+                touched.Add(topic);
+                var (tool, file, at) = found.FetchingTools[0];
+                throughTool = $"{topic.Label}: borne out by {tool}, which the app starts and which fetches from the internet " +
+                              $"({file} line {at}). The app makes no network call of its own.";
+            }
+            else if (linux && DeclarationScan.LinuxBlindSpots.ContainsKey(topic.Id) && declared.TryGetValue(topic.Id, out var unseen))
+            {
+                // The check can't see the Linux form of this topic (or only part of it), so it can't call the line false.
+                rows.Add(new CheckResult(Security, RowName(), CheckStatus.Info,
+                    $"{topic.Label} is declared ({readme} line {unseen.Line}). Not checked on Linux: {DeclarationScan.LinuxBlindSpots[topic.Id]}, " +
+                    "so the line can be neither confirmed nor called out of date. A topic the app doesn't touch is left out of the section."));
+            }
+            else if (declared.TryGetValue(topic.Id, out var line))
+            {
+                // A declaration the code doesn't bear out is a false statement too, in the milder direction.
+                rows.Add(new CheckResult(Security, RowName(), CheckStatus.Warn,
+                    $"{topic.Label} is declared ({readme} line {line.Line}), but no {NoUseWords(topic.Id)} was found. "
+                    + "If the app no longer does this, remove the line (the Fix does). If it does, in a way the check can't see, "
+                    + "exempt this topic with the reason.")
+                    { Fix = FixKind.UndeclareInReadme, FixProject = topic.Label });
+            }
+        }
+
+        var unknown = labels.Where(l => l.Topic is null).ToList();
+        if (unknown.Count > 0)
+            rows.Add(new CheckResult(Security, $"{DeclarationRuleName} (unknown label)", CheckStatus.Warn,
+                string.Join("\n", unknown.Select(l => $"Unknown label \"{l.Label}\" ({readme} line {l.Line})."
+                    + (DeclarationScan.RenamedLabels.TryGetValue(l.Label, out var renamed) ? $" Renamed: use \"{renamed}\"." : "")))
+                + $"\nUse one of: {string.Join(", ", DeclarationScan.Topics.Select(t => t.Label))}."));
+
+        var twice = labels.Where(l => l.Topic is not null).GroupBy(l => l.Topic!.Value).Where(g => g.Count() > 1).ToList();
+        if (twice.Count > 0)
+            rows.Add(new CheckResult(Security, $"{DeclarationRuleName} (duplicate label)", CheckStatus.Warn,
+                string.Join("\n", twice.Select(g =>
+                    $"{DeclarationScan.TopicOf(g.Key).Label} is declared twice: {readme} lines {string.Join(" and ", g.Select(l => l.Line))}. Keep one line per topic."))));
+
+        if (!rows.Any(x => x.Status is CheckStatus.Fail or CheckStatus.Warn))
+        {
+            var detail = touched.Count == 0
+                ? "Nothing to declare."
+                : $"{Plural(touched.Count, "topic")} declared: {string.Join(", ", touched.Select(t => t.Label.ToLowerInvariant()))}.";
+            if (throughTool is not null) detail += $"\n{throughTool}";
+            if (found.UnnamedStarts.Count > 0) detail += $"\n{UnnamedNote(found)}";
+            rows.Insert(0, new CheckResult(Security, DeclarationRuleName, CheckStatus.Pass, detail));
+        }
+
+        // Said on every Linux app, whatever the rows above: nothing found is not the same as nothing done.
+        if (linux)
+            rows.Add(new CheckResult(Security, $"{DeclarationRuleName} (not checked on Linux)", CheckStatus.Info,
+                "What the check can't see on Linux yet:" +
+                string.Concat(DeclarationScan.Topics.Where(t => DeclarationScan.LinuxBlindSpots.ContainsKey(t.Id))
+                    .Select(t => $"\n  {t.Label}: {DeclarationScan.LinuxBlindSpots[t.Id]}.")) +
+                "\nNothing found under these topics doesn't mean nothing is done. The other topics are read from .NET calls and " +
+                "project files, which are the same on both systems."));
+
+        r.AddRange(rows);
+    }
+
+    /// <summary>The paste-line words for a machine-wide write, worded as the declaration scan words its own.</summary>
+    private static string MachineKind(string via) => via switch
+    {
+        "the system drive" => "files on the system drive",
+        "ProgramData" => "files under ProgramData",
+        "Program Files" => "files under Program Files",
+        "the Windows folder" => "files under Windows",
+        "a folder on a fixed drive" => "files in a fixed folder on a drive",
+        _ => "files in folders shared by all users"
+    };
+
+    /// <summary>The line to paste that a declaration row ends with: "- **Label:** …".</summary>
+    public static string? DraftLine(CheckResult row) =>
+        row.Detail.Split('\n').LastOrDefault(l => l.StartsWith("- **", StringComparison.Ordinal));
+
+    private static string Evidence(List<DeclarationScan.Evidence> evidence)
+    {
+        // One site per thing found, the first two in full.
+        var sites = evidence
+            .GroupBy(e => (e.What, e.File, e.Line))
+            .Select(g => g.First())
+            .GroupBy(e => e.What, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.First())
+            .ToList();
+        var shown = sites.Take(2).Select(e => e.Line > 0 ? $"{e.What} at {e.File}:{e.Line}" : $"{e.What} in {e.File}");
+        int more = evidence.Select(e => (e.File, e.Line, e.What)).Distinct().Count() - Math.Min(2, sites.Count);
+        return string.Join("; ", shown) + (more > 0 ? $" (+{more} more)" : "") + ".";
+    }
+
+    private static string UnnamedNote(DeclarationScan.Found found) =>
+        $"Also starts {Plural(found.UnnamedStarts.Count, "program")} the check can't name: {Sample(found.UnnamedStarts, 3)}.";
+
+    private static string NoUseWords(DeclarationTopic topic) => topic switch
+    {
+        DeclarationTopic.NeedsAdministratorRights => "request for admin rights",
+        DeclarationTopic.ChangesSecuritySettings => "change to security settings",
+        DeclarationTopic.StartsOnItsOwn => "task, service or startup entry",
+        DeclarationTopic.StartsOtherPrograms => "program start",
+        DeclarationTopic.ChangesTheWholeComputer => "machine-wide write",
+        DeclarationTopic.TalksToOtherComputers => "network use",
+        DeclarationTopic.RunsCodeFromOutside => "code loaded at run time",
+        DeclarationTopic.RunsCodeWhenYouBuild => "code run during the build",
+        _ => "use of personal data"
+    };
+
+    /// <summary>The app manifest's requestedExecutionLevel when it asks for more than the user's rights, as evidence.</summary>
+    private static DeclarationScan.Evidence? ManifestElevation(RepoSnapshot s, ProjectModel p)
+    {
+        var manifestProp = p.Prop("ApplicationManifest");
+        var manifest = manifestProp is null ? null : s.Find(RepoSnapshot.Combine(p.Dir, manifestProp));
+        if (manifest?.Text is null) return null;
+
+        var match = ExecutionLevel.Match(XmlComment.Replace(manifest.Text, m => Regex.Replace(m.Value, "[^\n]", " ")));
+        if (!match.Success) return null;
+        var level = match.Groups["level"].Value;
+        if (level.Equals("asInvoker", StringComparison.OrdinalIgnoreCase)) return null;
+
+        int line = manifest.Text[..match.Index].Count(c => c == '\n') + 1;
+        return new DeclarationScan.Evidence(DeclarationTopic.NeedsAdministratorRights, level, "manifest", manifest.RelPath, line);
     }
 
     // ================= Reproducible build =================
@@ -1876,24 +2712,29 @@ public static class StandardsRules
     /// belong in AssemblyName.json next to the exe; anything else written there, and temp files, are
     /// listed so you see them. Read from the code; nothing is run.
     /// </summary>
-    private static void WriteRules(IReadOnlyList<SnapshotFile> files, ProjectModel? project, List<CheckResult> r, ExemptionMatcher exemptions)
+    private static string AssemblyOf(ProjectModel? project) =>
+        project?.Prop("AssemblyName") ?? (project is null ? "" : Path.GetFileNameWithoutExtension(project.RelPath));
+
+    private static List<WriteSite> WriteSites(IReadOnlyList<SnapshotFile> files, ProjectModel? project)
     {
-        var assembly = project?.Prop("AssemblyName")
-                       ?? (project is null ? "" : Path.GetFileNameWithoutExtension(project.RelPath));
         // Code the project leaves out of its build (<Compile Remove="Tests/**" />) never runs.
-        var removed = project is null ? []
-            : project.Items
-                .Where(i => i.Mode == ItemMode.Remove && i.Type == "Compile")
-                .SelectMany(i => i.Include.Split(';'))
-                .Select(x => x.Trim())
-                .Where(x => x.Length > 0 && !x.Contains("$(", StringComparison.Ordinal))
-                .Select(x => GlobToRegex(RepoSnapshot.Combine(project.Dir, x)))
-                .ToList();
+        var removed = project is null ? [] : CompileRemoved(project);
         var compiled = files.Where(f => !removed.Any(x => x.IsMatch(f.RelPath))).ToList();
-        var sites = WriteScan.Scan(compiled, assembly);
+        return WriteScan.Scan(compiled, AssemblyOf(project));
+    }
+
+    private static void WriteRules(List<WriteSite> sites, ProjectModel? project, List<CheckResult> r, ExemptionMatcher exemptions, bool linux)
+    {
+        // What the write check knows are .NET's folder names and Windows paths. On Linux the first still hold
+        // (ApplicationData is ~/.config, LocalApplicationData ~/.local/share); paths written out as text don't.
+        const string linuxAppData = " On Linux, ApplicationData is ~/.config and LocalApplicationData is ~/.local/share.";
+        const string linuxUnseen = " Not checked on Linux: paths written out as text, such as ~/.config, $XDG_CONFIG_HOME or ~/.local/share.";
+        var assembly = AssemblyOf(project);
         var settings = assembly.Length == 0 ? "AssemblyName.json" : assembly + ".json";
 
-        string Line(WriteSite w) => $"\n  {w.File} line {w.Line}: {w.Call} → {w.Via}" + (w.Method is null ? "" : $", in {w.Method}");
+        // The way the path came, when it came through other names, so a surprising place can be checked from here.
+        string Line(WriteSite w) => $"\n  {w.File} line {w.Line}: {w.Call} → {w.Via}" + (w.Method is null ? "" : $", in {w.Method}")
+                                    + (w.Through is null ? "" : $"; {w.Through}");
 
         // Each AppData write is checked against the exemptions on its own: only the ones covered drop out.
         const string appDataRule = "No AppData";
@@ -1913,6 +2754,7 @@ public static class StandardsRules
             r.Report(Code, appDataRule, CheckStatus.Fail,
                 $"Writes under the user's AppData in {Plural(appData.Count, "place")}. Files there are left behind when the app " +
                 $"is gone. Store settings in {settings} next to the exe (AppContext.BaseDirectory) instead." +
+                (linux ? linuxAppData : "") +
                 string.Concat(appData.Select(Line)) +
                 (covered.Count == 0 ? "" : $"\nExempt ({Plural(covered.Count, "place")}): {coveredReasons}" + coveredLines) +
                 tempNote);
@@ -1922,7 +2764,12 @@ public static class StandardsRules
                 { ExemptReason = coveredReasons });
         else if (temp.Count > 0)
             r.Report(Code, appDataRule, CheckStatus.Info,
-                "Nothing written under AppData. Writes to the temp folder, which is up to the app to clean up:" + string.Concat(temp.Select(Line)));
+                (linux ? "Nothing written under ApplicationData or LocalApplicationData (~/.config, ~/.local/share)." + linuxUnseen + " " : "Nothing written under AppData. ") +
+                "Writes to the temp folder, which is up to the app to clean up:" + string.Concat(temp.Select(Line)));
+        else if (linux)
+            // Not a Pass: the Linux way of writing these paths as text is one the check can't follow yet.
+            r.Report(Code, appDataRule, CheckStatus.Info,
+                "Nothing written under ApplicationData or LocalApplicationData (~/.config, ~/.local/share) or the temp folder." + linuxUnseen);
         else
             r.Report(Code, appDataRule, CheckStatus.Pass, "Nothing written under AppData or the temp folder.");
 
@@ -1931,12 +2778,26 @@ public static class StandardsRules
         var other = exe.Where(w => !w.Standard).ToList();
         if (other.Count > 0)
             r.Report(Code, exeRule, CheckStatus.Info,
-                $"Writes next to the exe besides {settings}, listed for information. A read-only folder (Program Files) makes these fail." +
+                $"Writes next to the exe besides {settings}, listed for information. A read-only folder ({(linux ? "/opt, /usr" : "Program Files")}) makes these fail." +
                 string.Concat(other.Select(Line)));
         else if (exe.Count > 0)
             r.Report(Code, exeRule, CheckStatus.Pass, $"Only {settings}, the settings standard.");
         else
             r.Report(Code, exeRule, CheckStatus.Pass, "Nothing written next to the exe.");
+
+        const string machineRule = "Writes machine-wide";
+        var machine = sites.Where(w => w.Target == WriteTarget.MachineWide).ToList();
+        if (machine.Count > 0)
+            r.Report(Code, machineRule, CheckStatus.Info,
+                $"Writes outside the users' folders in {Plural(machine.Count, "place")}, listed for information. These stay when the " +
+                "app and every user are gone, and usually need admin rights. Declare them in the README under \"Changes the whole computer\"." +
+                string.Concat(machine.Select(Line)));
+        else if (linux)
+            r.Report(Code, machineRule, CheckStatus.Info,
+                "Not checked on Linux: the check knows Windows' machine-wide places (Program Files, ProgramData, the Windows folder, drive letters), " +
+                "not /etc, /usr, /opt or /var. Nothing was found in the forms it knows.");
+        else
+            r.Report(Code, machineRule, CheckStatus.Pass, "Nothing written outside the users' folders.");
     }
 
     // ================= Helpers =================
@@ -1960,6 +2821,9 @@ public static class StandardsRules
     private static string Plural(int count, string noun) => $"{count} {noun}{(count == 1 ? "" : "s")}";
 
     private static string Plural(int count, string one, string many) => $"{count} {(count == 1 ? one : many)}";
+
+    private static string Share(long part, long whole) =>
+        whole <= 0 ? "–" : 100.0 * part / whole is var p && p < 0.1 && part > 0 ? "under 0.1 %" : $"{100.0 * part / whole:0.#} %";
 
     private static string Size(long bytes) =>
         bytes < 1024 ? $"{bytes} B" : bytes < 1024 * 1024 ? $"{bytes / 1024.0:0.#} KB" : $"{bytes / 1024.0 / 1024.0:0.#} MB";

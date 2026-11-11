@@ -59,14 +59,23 @@ public static class FixPlanner
     }
 
     /// <param name="unlistedPicks">The files ticked in the removal picker; only these are removed.</param>
+    /// <param name="imageChanges">The image files ticked in the image picker, already processed there.</param>
     public static FixPlan Plan(string source, string target, IEnumerable<FixTarget> fixes,
-                               IReadOnlyCollection<string>? unlistedPicks, DateTime day)
+                               IReadOnlyCollection<string>? unlistedPicks, DateTime day,
+                               IReadOnlyDictionary<string, ImageChange>? imageChanges = null)
     {
         var plan = new FixPlan { Source = source, Target = target, Day = day };
         var snapshot = RepoSnapshot.Load(source, isZip: true);
+        // The fixes follow the system the scan judged the app by: the snapshot's folder says which it is filed under.
+        var filed = AppPlatforms.FiledAt(source);
+        var platform = StandardsRules.PlatformOf(snapshot, filed);
+        snapshot.Platform = platform;
         var (main, apps, _) = StandardsRules.SelectProjects(snapshot);
         var ordered = fixes.Distinct().OrderBy(f => f.Kind).ThenBy(f => f.Project, StringComparer.OrdinalIgnoreCase).ToList();
         var edits = new Dictionary<string, FileEdit>(StringComparer.OrdinalIgnoreCase);
+        var declarations = new List<string>();
+        int images = 0;
+        var undeclarations = new List<string>();
 
         foreach (var fix in ordered)
         {
@@ -85,12 +94,12 @@ public static class FixPlanner
                     break;
 
                 case FixKind.RemoveUnlistedFiles:
-                    PlanUnlistedRemoval(plan, snapshot, unlistedPicks);
+                    PlanUnlistedRemoval(plan, snapshot, unlistedPicks, filed);
                     break;
 
                 case FixKind.PublishSettings:
                     if (main is null) plan.Skipped.Add("Publish settings: no app project found in the snapshot.");
-                    else PlanPublishSettings(plan, main, EditFor(plan, snapshot, edits, main.RelPath));
+                    else PlanPublishSettings(plan, main, EditFor(plan, snapshot, edits, main.RelPath), platform);
                     break;
 
                 case FixKind.AddVersion:
@@ -108,8 +117,20 @@ public static class FixPlanner
                     plan.Retime = true;
                     break;
 
+                case FixKind.OptimiseImages:
+                    images = PlanImages(plan, snapshot, imageChanges);
+                    break;
+
                 case FixKind.AddMitLicense:
                     PlanMitLicense(plan, snapshot, day);
+                    break;
+
+                case FixKind.DeclareInReadme:
+                    if (fix.Project is not null) declarations.Add(fix.Project);
+                    break;
+
+                case FixKind.UndeclareInReadme:
+                    if (fix.Project is not null) undeclarations.Add(fix.Project);
                     break;
 
                 case FixKind.NoCommitInVersion:
@@ -119,6 +140,8 @@ public static class FixPlanner
                     break;
             }
         }
+
+        int declared = declarations.Count + undeclarations.Count == 0 ? 0 : PlanDeclarations(plan, snapshot, declarations, undeclarations, filed);
 
         foreach (var (path, edit) in edits.Where(e => e.Value.Lines.Count > 0))
         {
@@ -130,9 +153,49 @@ public static class FixPlanner
         plan.Sections.Add(("Release timestamps",
             [$"{(plan.Retime ? "~ " : "")}every entry dated {day:yyyy-MM-dd} 00:00:00, in sorted order, without NTFS or extended timestamps"]));
 
-        plan.ChangeCount = plan.RemoveEntries.Count + plan.RemoveFolders.Count + plan.AddedFiles.Count + (plan.Retime ? 1 : 0)
+        plan.ChangeCount = declared + images + plan.RemoveEntries.Count + plan.RemoveFolders.Count + plan.AddedFiles.Count + (plan.Retime ? 1 : 0)
                            + edits.Values.Sum(e => e.Lines.Count(l => !l.StartsWith("  ", StringComparison.Ordinal)));
         return plan;
+    }
+
+    /// <summary>The image files ticked in the picker, replaced by the versions made there.</summary>
+    private static int PlanImages(FixPlan plan, RepoSnapshot snapshot, IReadOnlyDictionary<string, ImageChange>? changes)
+    {
+        if (changes is null || changes.Count == 0)
+        {
+            plan.Skipped.Add("Image files: none ticked.");
+            return 0;
+        }
+        var lines = new List<string>();
+        long saved = 0;
+        foreach (var (rel, change) in changes.OrderBy(c => c.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            var file = snapshot.Find(rel);
+            if (file is null)
+            {
+                plan.Skipped.Add($"Image files: {rel} isn't in the snapshot.");
+                continue;
+            }
+            if (plan.RemoveEntries.Contains(file.RelPath, StringComparer.OrdinalIgnoreCase))
+            {
+                plan.Skipped.Add($"Image files: {file.RelPath} is removed as an unlisted file, so it isn't changed.");
+                continue;
+            }
+            // The new version was made from the file as the picker read it; a newer snapshot may differ.
+            var current = snapshot.ReadBytes(file.RelPath);
+            if (current is null || ImageChange.Hash(current) != change.SourceHash)
+            {
+                plan.Skipped.Add($"Image files: {file.RelPath} changed since the picker read it; open the fix again.");
+                continue;
+            }
+            plan.EditedFiles[file.RelPath] = change.Bytes;
+            saved += file.Length - change.Bytes.Length;
+            lines.Add($"~ {file.RelPath}: {change.Summary}");
+        }
+        if (lines.Count == 0) return 0;
+        lines.Add($"  {lines.Count} file{(lines.Count == 1 ? "" : "s")}, {saved:N0} bytes smaller in all");
+        plan.Sections.Add(("Image files", lines));
+        return lines.Count - 1;
     }
 
     private static FileEdit? EditFor(FixPlan plan, RepoSnapshot snapshot, Dictionary<string, FileEdit> edits, string path)
@@ -195,7 +258,7 @@ public static class FixPlanner
                 .ToList()));
     }
 
-    private static void PlanUnlistedRemoval(FixPlan plan, RepoSnapshot snapshot, IReadOnlyCollection<string>? picks)
+    private static void PlanUnlistedRemoval(FixPlan plan, RepoSnapshot snapshot, IReadOnlyCollection<string>? picks, AppPlatform filed)
     {
         if (picks is null || picks.Count == 0)
         {
@@ -204,7 +267,7 @@ public static class FixPlanner
         }
 
         // Only files that are in the snapshot and still unlisted: a pick can never remove a source file.
-        StandardsRules.Run(snapshot, out var facts);
+        StandardsRules.Run(snapshot, out var facts, "", filed);
         var unlisted = facts.Unlisted.Select(u => u.RelPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var remove = picks.Where(unlisted.Contains).OrderBy(p => p, StringComparer.OrdinalIgnoreCase).ToList();
         foreach (var gone in picks.Where(p => !unlisted.Contains(p)))
@@ -215,18 +278,19 @@ public static class FixPlanner
         plan.Sections.Add(("Remove the unlisted files you ticked", remove.Select(p => "- " + p).ToList()));
     }
 
-    private static void PlanPublishSettings(FixPlan plan, ProjectModel project, FileEdit? edit)
+    private static void PlanPublishSettings(FixPlan plan, ProjectModel project, FileEdit? edit, AppPlatform platform)
     {
         if (edit is null) return;
 
-        foreach (var (property, value) in FixCatalog.PublishProperties)
+        // A Linux app gets the Linux runtime: the same five properties, with linux-x64 where a Windows app has win-x64.
+        foreach (var (property, value) in FixCatalog.PublishPropertiesFor(platform))
         {
             var current = project.Prop(property);
 
-            // A Windows RID that isn't win-x64 may be deliberate; never rewrite it.
+            // A runtime that isn't the standard's (win-arm64, linux-arm64) may be deliberate; never rewrite it.
             if (property == "RuntimeIdentifier" && current is not null)
             {
-                if (!current.StartsWith("win-", StringComparison.OrdinalIgnoreCase))
+                if (!current.StartsWith(Standard.RuntimePrefix(platform), StringComparison.OrdinalIgnoreCase))
                     plan.Skipped.Add($"RuntimeIdentifier: left as {current}, since it may be deliberate.");
                 continue;
             }
@@ -298,6 +362,102 @@ public static class FixPlanner
     /// Adds the standard MIT license as LICENSE.txt in the wrapper folder, with the release date's year
     /// and the license holder from the settings. Only when the snapshot has no license file at all.
     /// </summary>
+    /// <summary>
+    /// Brings the README's "Before you build or run it" section in line with the code, in one edit: removes
+    /// the lines of queued topics the code no longer bears out, then adds a draft line for each queued topic
+    /// it does but the README doesn't declare, adding the section if there is none. The added lines are the
+    /// ones the rule suggests, worked out again from the same snapshot, so the preview shows exactly what the
+    /// rows showed; the wording is a draft for the author to reword. A section left with nothing in it goes
+    /// too. Returns the number of lines added and removed.
+    /// </summary>
+    private static int PlanDeclarations(FixPlan plan, RepoSnapshot snapshot, List<string> topics, List<string> removals, AppPlatform filed)
+    {
+        var readmes = ReadmeCollector.Find(snapshot);
+        if (readmes.Count != 1)
+        {
+            plan.Skipped.Add("README declarations: the snapshot needs exactly one README (see the README rule).");
+            return 0;
+        }
+        var path = readmes[0];
+        var bytes = snapshot.ReadBytes(path);
+        if (bytes is null)
+        {
+            plan.Skipped.Add($"{path} couldn't be read from the zip.");
+            return 0;
+        }
+
+        // The rows as the scan reports them now; only topics still undeclared get a line, and only lines
+        // still not borne out are removed.
+        var current = StandardsRules.Run(snapshot, out _, "", filed);
+        var rows = current
+            .Where(r => r.Fix == FixKind.DeclareInReadme && r.FixProject is not null)
+            .ToDictionary(r => r.FixProject!, StringComparer.OrdinalIgnoreCase);
+        var stale = current
+            .Where(r => r.Fix == FixKind.UndeclareInReadme && r.FixProject is not null)
+            .Select(r => r.FixProject!)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var drafts = DeclarationScan.Topics
+            .Where(t => topics.Contains(t.Label, StringComparer.OrdinalIgnoreCase))
+            .Select(t => (Topic: t, Line: rows.TryGetValue(t.Label, out var row) ? StandardsRules.DraftLine(row) : null))
+            .ToList();
+        foreach (var (topic, _) in drafts.Where(d => d.Line is null))
+            plan.Skipped.Add($"README declarations: {topic.Label} is declared already, or no longer found.");
+        var lines = drafts.Where(d => d.Line is not null).Select(d => d.Line!).ToList();
+        foreach (var label in removals.Where(l => !stale.Contains(l)))
+            plan.Skipped.Add($"README declarations: {label} is borne out by the code again; its line stays.");
+        var remove = removals.Where(stale.Contains).ToList();
+        if (lines.Count == 0 && remove.Count == 0) return 0;
+
+        var (text, encoding) = CsprojEditor.Decode(bytes);
+        var newline = text.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+        var existing = text.Replace("\r\n", "\n").Split('\n').ToList();
+        var removed = new List<string>();
+
+        if (remove.Count > 0 && DeclarationScan.ReadSection(text) is { } section)
+        {
+            var gone = section.Labels
+                .Where(l => remove.Contains(l.Label, StringComparer.OrdinalIgnoreCase))
+                .Select(l => l.Line - 1)
+                .OrderByDescending(i => i)
+                .ToList();
+            foreach (var index in gone)
+            {
+                removed.Insert(0, existing[index]);
+                existing.RemoveAt(index);
+            }
+            removed.AddRange(DeclarationScan.RemoveEmptySection(existing).Select(l => l + "  (the section is empty now)"));
+        }
+
+        if (lines.Count == 0)
+        {
+            plan.EditedFiles[path] = CsprojEditor.Encode(string.Join(newline, existing), encoding);
+            plan.Sections.Add(($"Changes in {path}", removed.Select(l => "- " + l).ToList()));
+            return removed.Count(l => !l.EndsWith("(the section is empty now)", StringComparison.Ordinal));
+        }
+
+        var (before, addSection, blankBefore) = DeclarationScan.InsertionPoint(existing);
+
+        var insert = new List<string>();
+        if (blankBefore) insert.Add("");
+        if (addSection)
+        {
+            if (before > 0 && existing[before - 1].Trim().Length > 0) insert.Add("");
+            insert.Add($"## {DeclarationScan.Heading}");
+            insert.Add("");
+        }
+        insert.AddRange(lines);
+        if (addSection && before < existing.Count && existing[before].Trim().Length > 0) insert.Add("");
+
+        existing.InsertRange(before, insert);
+        plan.EditedFiles[path] = CsprojEditor.Encode(string.Join(newline, existing), encoding);
+        var preview = removed.Select(l => "- " + l).Concat(insert.Where(l => l.Length > 0).Select(l => "+ " + l))
+            .Append("  draft wording from what the check found; reword it in the README as you see fit");
+        if (blankBefore)
+            preview = preview.Append("  the section's own text stays as it is: check it still fits next to these lines");
+        plan.Sections.Add(($"Changes in {path}", preview.ToList()));
+        return lines.Count + removed.Count(l => !l.EndsWith("(the section is empty now)", StringComparison.Ordinal));
+    }
+
     private static void PlanMitLicense(FixPlan plan, RepoSnapshot snapshot, DateTime day)
     {
         var holder = Standard.Current.LicenseHolder;

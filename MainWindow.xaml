@@ -9,6 +9,21 @@
 
     <Window.Resources>
         <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
+        <!-- A preview in the Image files row: a button, so it takes a click, Enter and Space, and shows focus. -->
+        <ControlTemplate x:Key="RowThumbTemplate" TargetType="Button">
+            <Border x:Name="Bd" Background="{DynamicResource Brush.Base}" BorderBrush="{DynamicResource Brush.LineSoft}"
+                    BorderThickness="1" CornerRadius="{StaticResource Radius.Item}" Padding="6">
+                <ContentPresenter />
+            </Border>
+            <ControlTemplate.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter TargetName="Bd" Property="BorderBrush" Value="{DynamicResource Brush.LineStrong}" />
+                </Trigger>
+                <Trigger Property="IsKeyboardFocused" Value="True">
+                    <Setter TargetName="Bd" Property="BorderBrush" Value="{DynamicResource Brush.AccentLight}" />
+                </Trigger>
+            </ControlTemplate.Triggers>
+        </ControlTemplate>
         <ui:PackageVisibilityConverter x:Key="PackageVisibility" />
         <ui:PackageTooltipConverter x:Key="PackageTooltip" />
 
@@ -65,6 +80,12 @@
                     <Setter Property="Background" Value="{DynamicResource Brush.IndigoSoft}" />
                     <Setter Property="BorderBrush" Value="{DynamicResource Brush.IndigoEdge}" />
                 </DataTrigger>
+                <!-- Artwork: indigo too, the second finding that isn't a verdict. -->
+                <DataTrigger Binding="{Binding Status}" Value="Artwork">
+                    <Setter Property="Foreground" Value="{DynamicResource Brush.IndigoText}" />
+                    <Setter Property="Background" Value="{DynamicResource Brush.IndigoSoft}" />
+                    <Setter Property="BorderBrush" Value="{DynamicResource Brush.IndigoEdge}" />
+                </DataTrigger>
                 <DataTrigger Binding="{Binding Status}" Value="Warn">
                     <Setter Property="Foreground" Value="{DynamicResource Brush.WarnText}" />
                     <Setter Property="Background" Value="{DynamicResource Brush.WarnSoft}" />
@@ -117,8 +138,8 @@
                     </StackPanel>
                 </StackPanel>
 
-                <!-- Apps by worst status, then apps with a license to review (indigo, apart from the
-                     verdicts). Hidden until a scan finishes; a zero count goes grey.
+                <!-- Apps by worst status, then apps with a license or artwork to review (indigo, apart
+                     from the verdicts). Hidden until a scan finishes; a zero count goes grey.
                      Click one to show only those apps in the list; click it again to show all. -->
                 <StackPanel x:Name="SummaryPills" Orientation="Horizontal" Visibility="Collapsed"
                             AutomationProperties.Name="Scan summary">
@@ -130,6 +151,8 @@
                                   ToolTip="Show only apps with a failing check. Click again to show all." />
                     <ToggleButton x:Name="LicensePill" Style="{StaticResource Header.PillToggle}" Click="AppPill_Click" Margin="8,0,0,0"
                                   ToolTip="Show only apps that aren't on the standard MIT license: no license file, another license, or MIT that isn't standard. Click again to show all." />
+                    <ToggleButton x:Name="ArtworkPill" Style="{StaticResource Header.PillToggle}" Click="AppPill_Click" Margin="8,0,0,0"
+                                  ToolTip="Show only apps with image files that carry metadata nothing displays or could be smaller at their level. Click again to show all." />
                 </StackPanel>
 
                 <!-- Right: the settings gear, then version, SDK, runtime and which standard is in use. -->
@@ -218,6 +241,10 @@
                             <StackPanel Grid.Column="1" Margin="12,0,0,0">
                                 <StackPanel Orientation="Horizontal">
                                     <TextBlock Text="{Binding AppName}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+                                    <!-- A Linux app says so; every other app is a Windows app. -->
+                                    <TextBlock Text="Linux" Style="{StaticResource Text.Caption}" Margin="7,0,0,0" VerticalAlignment="Center"
+                                               ToolTip="A Linux app: checked against the Linux part of the standard"
+                                               Visibility="{Binding IsLinux, Converter={StaticResource BoolToVisibility}}" />
                                     <Path Data="{StaticResource Icon.Shield}" Style="{StaticResource Badge.Icon}"
                                           ToolTip="Asks for admin rights"
                                           Visibility="{Binding Elevated, Converter={StaticResource BoolToVisibility}}" />
@@ -261,8 +288,12 @@
                                     <TextBlock x:Name="DetailName" Style="{StaticResource Text.Heading}" VerticalAlignment="Center" />
                                     <TextBlock x:Name="DetailVersion" Style="{StaticResource Text.Heading}" VerticalAlignment="Center"
                                                Margin="10,0,0,0" Foreground="{DynamicResource Brush.TextDim}" />
-                                    <ContentControl x:Name="AdminBadge" Style="{StaticResource Hue.Tag}"
+                                    <ContentControl x:Name="SystemBadge" Style="{StaticResource Hue.Tag}"
                                                     Margin="12,0,0,0" Visibility="Collapsed">
+                                        <TextBlock x:Name="SystemBadgeText" VerticalAlignment="Center" />
+                                    </ContentControl>
+                                    <ContentControl x:Name="AdminBadge" Style="{StaticResource Hue.Tag}"
+                                                    Margin="6,0,0,0" Visibility="Collapsed">
                                         <StackPanel Orientation="Horizontal">
                                             <Path Style="{StaticResource Hue.Icon}" Data="{StaticResource Icon.Shield}" />
                                             <TextBlock Text="Admin rights" Margin="5,0,0,0" VerticalAlignment="Center" />
@@ -340,6 +371,13 @@
                                     <TextBlock x:Name="FilterLicenseText" Margin="8,0,0,0" VerticalAlignment="Center" />
                                 </StackPanel>
                             </ToggleButton>
+                            <ToggleButton x:Name="FilterArtwork" Tag="Artwork" Margin="0,0,8,0" Click="Filter_Click"
+                                          ToolTip="Show only the image files finding. Click again to show all.">
+                                <StackPanel Orientation="Horizontal">
+                                    <ContentControl Style="{StaticResource Hue.Marker}" Foreground="{DynamicResource Brush.Indigo}" />
+                                    <TextBlock x:Name="FilterArtworkText" Margin="8,0,0,0" VerticalAlignment="Center" />
+                                </StackPanel>
+                            </ToggleButton>
                             <ToggleButton x:Name="FilterWarn" Tag="Warn" Margin="0,0,8,0" Click="Filter_Click"
                                           ToolTip="Show only findings to review. Click again to show all.">
                                 <StackPanel Orientation="Horizontal">
@@ -400,6 +438,47 @@
                                                                                    Foreground="{DynamicResource Brush.Text}" />
                                                                         <TextBlock Text="{Binding Detail}" Style="{StaticResource Text.Body}"
                                                                                    Margin="0,3,0,0" />
+                                                                        <!-- Every image file, small, to-do ones first: to see what's involved. -->
+                                                                        <ItemsControl ItemsSource="{Binding Thumbs}" Margin="0,10,0,0" Focusable="False"
+                                                                                      Visibility="{Binding HasThumbs, Converter={StaticResource BoolToVisibility}}">
+                                                                            <ItemsControl.ItemsPanel>
+                                                                                <ItemsPanelTemplate>
+                                                                                    <WrapPanel />
+                                                                                </ItemsPanelTemplate>
+                                                                            </ItemsControl.ItemsPanel>
+                                                                            <ItemsControl.ItemTemplate>
+                                                                                <DataTemplate>
+                                                                                    <Button Template="{StaticResource RowThumbTemplate}" Click="RowThumb_Click"
+                                                                                            Cursor="Hand" Width="112" Margin="0,0,8,8"
+                                                                                            ToolTip="{Binding ToolTip}"
+                                                                                            AutomationProperties.Name="{Binding RelPath}">
+                                                                                        <StackPanel>
+                                                                                            <Grid Height="64">
+                                                                                                <Image Source="{Binding Image}" Stretch="Uniform" StretchDirection="DownOnly"
+                                                                                                       RenderOptions.BitmapScalingMode="HighQuality" />
+                                                                                                <TextBlock Text="{Binding Status}" Style="{StaticResource Text.Caption}"
+                                                                                                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                                                                           TextWrapping="Wrap" TextAlignment="Center" />
+                                                                                            </Grid>
+                                                                                            <TextBlock Text="{Binding Name}" Style="{StaticResource Text.Caption}"
+                                                                                                       Foreground="{DynamicResource Brush.Text}"
+                                                                                                       TextTrimming="CharacterEllipsis" Margin="0,6,0,0" />
+                                                                                            <TextBlock Text="{Binding Caption}" TextTrimming="CharacterEllipsis">
+                                                                                                <TextBlock.Style>
+                                                                                                    <Style TargetType="TextBlock" BasedOn="{StaticResource Text.Caption}">
+                                                                                                        <Style.Triggers>
+                                                                                                            <DataTrigger Binding="{Binding ToDo}" Value="True">
+                                                                                                                <Setter Property="Foreground" Value="{DynamicResource Brush.IndigoText}" />
+                                                                                                            </DataTrigger>
+                                                                                                        </Style.Triggers>
+                                                                                                    </Style>
+                                                                                                </TextBlock.Style>
+                                                                                            </TextBlock>
+                                                                                        </StackPanel>
+                                                                                    </Button>
+                                                                                </DataTemplate>
+                                                                            </ItemsControl.ItemTemplate>
+                                                                        </ItemsControl>
                                                                     </StackPanel>
                                                                     <ToggleButton Grid.Column="2" Content="{Binding FixLabel}"
                                                                                   IsChecked="{Binding IsQueued, Mode=TwoWay}"

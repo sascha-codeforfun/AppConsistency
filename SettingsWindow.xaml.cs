@@ -39,7 +39,13 @@ public partial class SettingsWindow : Window
 
         var file = settings.Standard;
 
-        Add(new PackageListCard(this, file?.ApprovedPackages));
+        // What differs by system comes first, in the file's three blocks: Hybrid, Windows, Linux.
+        AddHybridCards(file?.Hybrid);
+        AddWindowsCards(file?.Windows);
+        AddLinuxCards(file?.Linux);
+
+        Heading("Every app",
+            "The rest has nothing to do with the system an app is for. These settings sit directly under Standard in the file.");
 
         Add(new NameListCard(this, "Private files", "Standard.PrivateFiles",
             "Your own working notes. Kept in every zip you build and in the backup; left out only when you stage for publishing. " +
@@ -48,6 +54,22 @@ public partial class SettingsWindow : Window
             (f, list) => f.PrivateFiles = list));
 
         Add(new ExemptionListCard(this, file?.Exemptions));
+
+        var images = file?.Images;
+        Add(new FieldsCard(this, "Images", "Standard.Images",
+            "The level for image files no entry under Image levels names, and how much colour difference a palette " +
+            "(Smallest) may cause before it isn't offered. Levels: AsIs, Strip, Lossless, Smallest. Limits: Invisible " +
+            "(99 % of pixels within ΔE 1.0, no spot beyond 3.0) or Slight (99 % within 2.3, no spot beyond 6.0).",
+            [
+                new Field("Default level", Standard.DefaultImages.DefaultLevel, images?.DefaultLevel,
+                    v => ImageLevelEntry.TryLevel(v, out _) ? null : $"\"{v}\" isn't a level: AsIs, Strip, Lossless or Smallest."),
+                new Field("Palette limit", Standard.DefaultImages.LossLimit, images?.LossLimit,
+                    v => v.Trim().Equals("Invisible", StringComparison.OrdinalIgnoreCase) || v.Trim().Equals("Slight", StringComparison.OrdinalIgnoreCase)
+                        ? null : $"\"{v}\" isn't a limit: Invisible or Slight.")
+            ],
+            (f, v) => f.Images = new ImageSettings { DefaultLevel = v[0], LossLimit = v[1] }));
+
+        Add(new ImageLevelListCard(this, file?.ImageLevels));
 
         Add(new FieldsCard(this, "License holder", "Standard.LicenseHolder",
             "The name the MIT license fix writes into the copyright line, with the release date's year. " +
@@ -71,12 +93,6 @@ public partial class SettingsWindow : Window
             Standard.DefaultWebPackages, file?.WebPackages, NameKind.Package, "Package name",
             (f, list) => f.WebPackages = list));
 
-        Add(new FieldsCard(this, "Minimum target framework", "Standard.MinimumTargetFramework",
-            "The lowest target framework a project may use. Newer passes, as long as the platform is the same.",
-            [new Field("Target framework", Standard.DefaultMinimumTargetFramework, file?.MinimumTargetFramework,
-                v => Standard.ParseTargetFramework(v) is null ? $"\"{v}\" isn't a target framework like net10.0-windows." : null)],
-            (f, v) => f.MinimumTargetFramework = v[0]));
-
         var icon = file?.Icon;
         Add(new FieldsCard(this, "Icon and header", "Standard.Icon",
             "The exe icon every app sets as ApplicationIcon, and the header image beside its name, with its size in pixels.",
@@ -91,9 +107,9 @@ public partial class SettingsWindow : Window
         var publish = file?.Publish;
         var p = Standard.DefaultPublish;
         Add(new FieldsCard(this, "Publish properties", "Standard.Publish",
-            "What every app's .csproj sets for a single self-contained exe, and its DebugType. The fixes write these values.",
+            "What every app's .csproj sets for a single self-contained program, and its DebugType. The fixes write these values. " +
+            "The fifth publish property, the RuntimeIdentifier, differs by system: see Windows: runtime and Linux: runtime.",
             [
-                new Field("RuntimeIdentifier", p.RuntimeIdentifier, publish?.RuntimeIdentifier, NotEmpty("RuntimeIdentifier")),
                 new Field("SelfContained", p.SelfContained, publish?.SelfContained, NotEmpty("SelfContained")),
                 new Field("PublishSingleFile", p.PublishSingleFile, publish?.PublishSingleFile, NotEmpty("PublishSingleFile")),
                 new Field("IncludeNativeLibrariesForSelfExtract", p.IncludeNativeLibrariesForSelfExtract, publish?.IncludeNativeLibrariesForSelfExtract, NotEmpty("IncludeNativeLibrariesForSelfExtract")),
@@ -102,8 +118,8 @@ public partial class SettingsWindow : Window
             ],
             (f, v) => f.Publish = new PublishSettings
             {
-                RuntimeIdentifier = v[0], SelfContained = v[1], PublishSingleFile = v[2],
-                IncludeNativeLibrariesForSelfExtract = v[3], EnableCompressionInSingleFile = v[4], DebugType = v[5]
+                SelfContained = v[0], PublishSingleFile = v[1],
+                IncludeNativeLibrariesForSelfExtract = v[2], EnableCompressionInSingleFile = v[3], DebugType = v[4]
             }));
 
         var release = file?.Release;
@@ -120,6 +136,124 @@ public partial class SettingsWindow : Window
             v => $"For example: App{v[0]}.zip · {Standard.FormatName(v[1], DateTime.Now)} · {Standard.FormatName(v[2], DateTime.Now)}"));
 
         Loaded += (_, _) => CancelButton.Focus();
+    }
+
+    /// <summary>A heading over a group of cards, with a line saying what the group is.</summary>
+    private void Heading(string title, string about)
+    {
+        var heading = new TextBlock
+        {
+            Text = title,
+            FontWeight = FontWeights.SemiBold,
+            FontSize = 17,
+            Margin = new Thickness(2, CardsPanel.Children.Count == 0 ? 0 : 12, 0, 4)
+        };
+        heading.SetResourceReference(TextBlock.ForegroundProperty, "Brush.Text");
+        CardsPanel.Children.Add(heading);
+
+        var line = Text(about, "Text.Caption", wrap: true);
+        line.Margin = new Thickness(2, 0, 0, 14);
+        line.MaxWidth = 760;
+        line.HorizontalAlignment = HorizontalAlignment.Left;
+        CardsPanel.Children.Add(line);
+    }
+
+    private const string PackageRule =
+        " Any other package fails the third-party packages check, and so does one below its minimum version. " +
+        "Packages in libraries the app references count too; packages only a test project uses are never checked.";
+
+    /// <summary>The "Hybrid" block of the file: packages approved for apps of both systems.</summary>
+    private void AddHybridCards(HybridFile? hybrid)
+    {
+        Heading("Hybrid",
+            "Packages for both systems: the ones Windows and Linux apps really share, such as an HTML parser both editions of one app " +
+            "ship. A package only one system uses belongs under that system.");
+
+        Add(new PackageListCard(this, "Hybrid: approved packages", "Standard.Hybrid.ApprovedPackages",
+            "Third-party NuGet packages you accept in Windows and Linux apps alike." + PackageRule,
+            "No Hybrid packages: an app may only use the packages approved for its own system.",
+            Standard.DefaultApprovedPackages, hybrid?.ApprovedPackages,
+            (f, list) => (f.Hybrid ??= new HybridFile()).ApprovedPackages = list));
+    }
+
+    /// <summary>The "Windows" block of the file: what holds for Windows apps only. The mirror of the Linux cards.</summary>
+    private void AddWindowsCards(WindowsFile? windows)
+    {
+        Heading("Windows apps",
+            $"Every app whose folder in the history folder doesn't end in {AppPlatforms.LinuxSuffix}. A Windows app is written with WPF.");
+
+        Add(new PackageListCard(this, "Windows: approved packages", "Standard.Windows.ApprovedPackages",
+            "Packages a Windows app may use on top of the Hybrid ones. They are never approved for a Linux app." + PackageRule,
+            "No Windows packages: a Windows app may only use the Hybrid packages.",
+            Standard.DefaultApprovedPackages, windows?.ApprovedPackages,
+            (f, list) => (f.Windows ??= new WindowsFile()).ApprovedPackages = list));
+
+        Add(new FieldsCard(this, "Windows: minimum target framework", "Standard.Windows.MinimumTargetFramework",
+            "The lowest target framework a Windows app may use. Newer passes, as long as the platform is the same.",
+            [new Field("Target framework", Standard.DefaultMinimumTargetFramework, windows?.MinimumTargetFramework,
+                v => Standard.ParseTargetFramework(v) is null ? $"\"{v}\" isn't a target framework like net10.0-windows." : null)],
+            (f, v) => (f.Windows ??= new WindowsFile()).MinimumTargetFramework = v[0]));
+
+        Add(new FieldsCard(this, "Windows: runtime", "Standard.Windows.RuntimeIdentifier",
+            "The RuntimeIdentifier the publish fix writes into a Windows app's .csproj when it has none. The check itself accepts any " +
+            "win- runtime (win-arm64 too); the other four publish properties are the ones under Publish properties.",
+            [new Field("RuntimeIdentifier", Standard.DefaultWindowsRuntimeIdentifier, windows?.RuntimeIdentifier,
+                v => v.StartsWith("win-", StringComparison.OrdinalIgnoreCase) && v.Length > 4 ? null
+                   : $"\"{v}\" isn't a Windows runtime like win-x64.")],
+            (f, v) => (f.Windows ??= new WindowsFile()).RuntimeIdentifier = v[0]));
+    }
+
+    /// <summary>
+    /// What a Linux app is held to where it differs from a Windows app: the "Linux" block of the file. An
+    /// app is a Linux app when its folder in the history folder ends in LINUX. Every card writes its own key
+    /// under Standard.Linux; a file without the block uses the defaults shown.
+    /// </summary>
+    private void AddLinuxCards(LinuxFile? linux)
+    {
+        Heading("Linux apps",
+            $"Every app whose folder in the history folder ends in {AppPlatforms.LinuxSuffix} (capitals). A Linux app is written with Avalonia where a " +
+            "Windows app uses WPF.");
+
+        Add(new PackageListCard(this, "Linux: approved packages", "Standard.Linux.ApprovedPackages",
+            "Packages a Linux app may use on top of the Hybrid ones: Avalonia and its parts. They are never approved for a " +
+            "Windows app, where a reference to Avalonia still fails." + PackageRule,
+            "No Linux packages are approved: a Linux app's Avalonia references fail until they are listed here.",
+            Standard.DefaultLinuxApprovedPackages, linux?.ApprovedPackages,
+            (f, list) => (f.Linux ??= new LinuxFile()).ApprovedPackages = list));
+
+        Add(new NameListCard(this, "Linux: forbidden packages", "Standard.Linux.ForbiddenPackages",
+            "Packages a Linux app must not reference, approved or not. Avalonia.Desktop is the usual convenience package; it brings " +
+            "the Windows and macOS backends along, so a Linux app names the Linux backends in Program.cs instead.",
+            Standard.DefaultLinuxForbiddenPackages, linux?.ForbiddenPackages, NameKind.Package, "Package name",
+            (f, list) => (f.Linux ??= new LinuxFile()).ForbiddenPackages = list));
+
+        Add(new NameListCard(this, "Linux: packages with a version of their own", "Standard.Linux.OwnVersionPackages",
+            "The Avalonia packages of an app have to be on one version. The ones listed here are left out of that check: " +
+            "the data grid is a package of its own since Avalonia 12, with its own version line.",
+            Standard.DefaultLinuxOwnVersionPackages, linux?.OwnVersionPackages, NameKind.Package, "Package name",
+            (f, list) => (f.Linux ??= new LinuxFile()).OwnVersionPackages = list));
+
+        Add(new NameListCard(this, "Linux: whitelist", "Standard.Linux.Whitelist",
+            "Files a Linux repo may hold on top of the whitelist under Every app: Avalonia's markup. In a folder that isn't a Linux app's, an .axaml file warns.",
+            Standard.DefaultLinuxWhitelist, linux?.Whitelist, NameKind.Pattern, "Pattern, e.g. *.axaml",
+            (f, list) => (f.Linux ??= new LinuxFile()).Whitelist = list));
+
+        Add(new FieldsCard(this, "Linux: minimum target framework", "Standard.Linux.MinimumTargetFramework",
+            "The lowest target framework a Linux app may use. Newer passes; a framework with a platform (net10.0-windows) fails, " +
+            "since it can't be built for Linux.",
+            [new Field("Target framework", Standard.DefaultLinuxMinimumTargetFramework, linux?.MinimumTargetFramework,
+                v => Standard.ParseTargetFramework(v) is not { } parsed ? $"\"{v}\" isn't a target framework like net10.0."
+                   : parsed.Platform.Length > 0 ? $"\"{v}\" names a platform. A Linux app's framework has none: net10.0."
+                   : null)],
+            (f, v) => (f.Linux ??= new LinuxFile()).MinimumTargetFramework = v[0]));
+
+        Add(new FieldsCard(this, "Linux: runtime", "Standard.Linux.RuntimeIdentifier",
+            "The RuntimeIdentifier the publish fix writes into a Linux app's .csproj when it has none. The check itself accepts any " +
+            "linux- runtime (linux-arm64 too); the other four publish properties are the ones under Publish properties.",
+            [new Field("RuntimeIdentifier", Standard.DefaultLinuxRuntimeIdentifier, linux?.RuntimeIdentifier,
+                v => v.StartsWith("linux-", StringComparison.OrdinalIgnoreCase) && v.Length > 6 ? null
+                   : $"\"{v}\" isn't a Linux runtime like linux-x64.")],
+            (f, v) => (f.Linux ??= new LinuxFile()).RuntimeIdentifier = v[0]));
     }
 
     /// <summary>True when the settings were saved; the caller applies them and rescans.</summary>
@@ -405,21 +539,29 @@ public partial class SettingsWindow : Window
     /// <summary>Approved packages: name, minimum version and reason, with how many apps use each.</summary>
     private sealed class PackageListCard : Card
     {
+        private readonly IReadOnlyList<PackageEntry> _defaults;
+        private readonly string _emptyNote;
+        private readonly Action<StandardFile, List<PackageEntry>> _write;
         private List<PackageEntry> _entries;
         private string? _error;
 
-        public PackageListCard(SettingsWindow window, List<PackageEntry>? fromFile)
-            : base(window, "Approved packages", "Standard.ApprovedPackages",
-                "Third-party NuGet packages you accept. Any other package fails the third-party packages check, " +
-                "and so does one below its minimum version. Packages in libraries the app references count too.",
-                "none", fromFile is not null)
+        /// <param name="emptyNote">What an empty list means, shown in its place.</param>
+        /// <param name="write">Where the list goes in the file: the general list, or the one for Linux apps.</param>
+        public PackageListCard(SettingsWindow window, string title, string key, string description, string emptyNote,
+                               IReadOnlyList<PackageEntry> defaults, List<PackageEntry>? fromFile,
+                               Action<StandardFile, List<PackageEntry>> write)
+            : base(window, title, key, description,
+                defaults.Count == 0 ? "none" : string.Join(", ", defaults.Select(d => d.Name)), fromFile is not null)
         {
-            _entries = (fromFile ?? Standard.DefaultApprovedPackages.ToList()).Select(p => p.Clone()).ToList();
+            _defaults = defaults;
+            _emptyNote = emptyNote;
+            _write = write;
+            _entries = (fromFile ?? defaults.ToList()).Select(p => p.Clone()).ToList();
         }
 
-        protected override void ResetToDefault() => _entries = Standard.DefaultApprovedPackages.Select(p => p.Clone()).ToList();
+        protected override void ResetToDefault() => _entries = _defaults.Select(p => p.Clone()).ToList();
 
-        public override void Write(StandardFile file) => file.ApprovedPackages = _entries.Select(p => p.Clone()).ToList();
+        public override void Write(StandardFile file) => _write(file, _entries.Select(p => p.Clone()).ToList());
 
         public override IEnumerable<string> Validate()
         {
@@ -431,7 +573,7 @@ public partial class SettingsWindow : Window
         {
             Body.Children.Clear();
             if (_entries.Count == 0)
-                Body.Children.Add(Note("No approved packages: every third-party package fails."));
+                Body.Children.Add(Note(_emptyNote));
 
             foreach (var entry in _entries.OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase))
             {
@@ -665,6 +807,162 @@ public partial class SettingsWindow : Window
             };
 
             var heading = Text("Add an exemption", "Text.Caption");
+            heading.Margin = new Thickness(0, 8, 0, 6);
+            Body.Children.Add(heading);
+            Body.Children.Add(grid);
+        }
+    }
+
+    /// <summary>Image levels: per app, a file or a pattern, its level and an optional reason.</summary>
+    private sealed class ImageLevelListCard : Card
+    {
+        private static readonly string[] LevelNames = ["AsIs", "Strip", "Lossless", "Smallest"];
+        private static readonly string[] LevelWords = ["As is", "Strip", "Lossless", "Smallest"];
+
+        private List<ImageLevelEntry> _entries;
+        private string? _error;
+
+        public ImageLevelListCard(SettingsWindow window, List<ImageLevelEntry>? fromFile)
+            : base(window, "Image levels", "Standard.ImageLevels",
+                "What may be done to an app's image files (PNG, ICO, JPEG): As is changes nothing; Strip removes metadata " +
+                "nothing displays; Lossless also recompresses, every pixel kept; Smallest also offers a palette within the " +
+                "loss limit, used only where you tick it. A path is the end of a file's path, or a pattern (* within a folder " +
+                "name, ** across folders). An entry naming a file wins over a pattern; of several patterns, the longest. " +
+                "The image picker adds entries when you change a level there.",
+                "none", fromFile is not null)
+        {
+            _entries = (fromFile ?? Standard.DefaultImageLevels.ToList()).Select(e => e.Clone()).ToList();
+        }
+
+        protected override void ResetToDefault() => _entries = Standard.DefaultImageLevels.Select(e => e.Clone()).ToList();
+
+        public override void Write(StandardFile file) => file.ImageLevels = _entries.Select(e => e.Clone()).ToList();
+
+        public override IEnumerable<string> Validate()
+        {
+            foreach (var e in _entries.Where(e => !ImageLevelEntry.TryLevel(e.Level, out _)))
+                yield return $"The image level \"{e.Level}\" for {e.App} · {e.Path} isn't one of As is, Strip, Lossless or Smallest.";
+        }
+
+        /// <summary>The level's place in the list, or -1 for a level that can't be read, so choosing any one fires.</summary>
+        private static int IndexOf(string level) =>
+            ImageLevelEntry.TryLevel(level, out var l) ? (int)l : -1;
+
+        public override void Render()
+        {
+            Body.Children.Clear();
+            if (_entries.Count == 0)
+                Body.Children.Add(Note("No entries: every image file gets the default level."));
+
+            foreach (var entry in _entries.OrderBy(e => e.App, StringComparer.OrdinalIgnoreCase).ThenBy(e => e.Path, StringComparer.OrdinalIgnoreCase))
+            {
+                var left = new StackPanel();
+                var name = Text($"{entry.App} · {entry.Path}", "Text.Mono");
+                name.FontSize = 13;
+                name.SetResourceReference(TextBlock.ForegroundProperty, "Brush.Text");
+                name.TextWrapping = TextWrapping.Wrap;
+                left.Children.Add(name);
+
+                if (Unlocked)
+                {
+                    var line = new Grid { Margin = new Thickness(0, 8, 0, 0) };
+                    line.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                    line.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                    var level = new ComboBox { MinWidth = 130, ItemsSource = LevelWords, SelectedIndex = IndexOf(entry.Level) };
+                    level.SelectionChanged += (_, _) => { if (level.SelectedIndex >= 0) entry.Level = LevelNames[level.SelectedIndex]; };
+                    AutomationProperties.SetName(level, $"Level for {entry.App} {entry.Path}");
+                    line.Children.Add(level);
+                    var reason = new TextBox { Text = entry.Reason ?? "", Margin = new Thickness(8, 0, 0, 0), ToolTip = "Why this level (optional)" };
+                    reason.TextChanged += (_, _) => entry.Reason = reason.Text.Trim().Length == 0 ? null : reason.Text.Trim();
+                    AutomationProperties.SetName(reason, $"Reason for {entry.App} {entry.Path}");
+                    Grid.SetColumn(reason, 1);
+                    line.Children.Add(reason);
+                    left.Children.Add(line);
+                }
+                else
+                {
+                    var what = Text((IndexOf(entry.Level) is >= 0 and var i ? LevelWords[i] : entry.Level + " (not a level)") + (entry.Reason is { Length: > 0 } r ? " · " + r : ""), "Text.Body", wrap: true);
+                    what.Margin = new Thickness(0, 4, 0, 0);
+                    left.Children.Add(what);
+                }
+
+                left.Children.Add(UsageLine(SettingsUsage.ImageLevel(entry, Window._apps)));
+                Body.Children.Add(Row(left, entry.Enabled, on => entry.Enabled = on, () => _entries.Remove(entry)));
+            }
+
+            if (!Unlocked) return;
+
+            if (_error is not null) Body.Children.Add(Note(_error, warn: true));
+
+            var grid = new Grid { Margin = new Thickness(0, 4, 0, 0) };
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(170) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            for (int i = 0; i < 4; i++) grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            TextBox Box(int row, string caption, string hint)
+            {
+                var c = Text(caption, "Text.Caption");
+                c.VerticalAlignment = VerticalAlignment.Center;
+                c.Margin = new Thickness(0, row == 0 ? 0 : 6, 12, 0);
+                Grid.SetRow(c, row);
+                grid.Children.Add(c);
+                var b = new TextBox { ToolTip = hint, Margin = new Thickness(0, row == 0 ? 0 : 6, 0, 0) };
+                AutomationProperties.SetName(b, "New image level " + caption);
+                Grid.SetRow(b, row);
+                Grid.SetColumn(b, 1);
+                grid.Children.Add(b);
+                return b;
+            }
+
+            var app = Box(0, "App", "The app's folder name in the history folder");
+            var path = Box(1, "File or pattern", "The end of a path, e.g. Assets/Scripts/*.png or screenshots/main.png");
+
+            var levelCaption = Text("Level", "Text.Caption");
+            levelCaption.VerticalAlignment = VerticalAlignment.Center;
+            levelCaption.Margin = new Thickness(0, 6, 12, 0);
+            Grid.SetRow(levelCaption, 2);
+            grid.Children.Add(levelCaption);
+            var newLevel = new ComboBox { ItemsSource = LevelWords, SelectedIndex = 0, MinWidth = 130, HorizontalAlignment = HorizontalAlignment.Left, Margin = new Thickness(0, 6, 0, 0) };
+            AutomationProperties.SetName(newLevel, "New image level");
+            Grid.SetRow(newLevel, 2);
+            Grid.SetColumn(newLevel, 1);
+            grid.Children.Add(newLevel);
+
+            var reasonCaption = Text("Reason (optional)", "Text.Caption");
+            reasonCaption.VerticalAlignment = VerticalAlignment.Center;
+            reasonCaption.Margin = new Thickness(0, 6, 12, 0);
+            Grid.SetRow(reasonCaption, 3);
+            grid.Children.Add(reasonCaption);
+            var reasonRow = new Grid { Margin = new Thickness(0, 6, 0, 0) };
+            reasonRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            reasonRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var newReason = new TextBox { ToolTip = "Why this level, e.g. a changed shade could change what it shows" };
+            AutomationProperties.SetName(newReason, "New image level reason");
+            var addButton = new Button { Content = "Add level", Margin = new Thickness(8, 0, 0, 0) };
+            Grid.SetColumn(addButton, 1);
+            reasonRow.Children.Add(newReason);
+            reasonRow.Children.Add(addButton);
+            Grid.SetRow(reasonRow, 3);
+            Grid.SetColumn(reasonRow, 1);
+            grid.Children.Add(reasonRow);
+
+            addButton.Click += (_, _) =>
+            {
+                var entry = new ImageLevelEntry
+                {
+                    App = app.Text.Trim(), Path = path.Text.Trim().Replace('\\', '/'),
+                    Level = LevelNames[Math.Max(0, newLevel.SelectedIndex)],
+                    Reason = newReason.Text.Trim().Length == 0 ? null : newReason.Text.Trim()
+                };
+                _error = entry.App.Length == 0 ? "Enter the app the level is for."
+                    : entry.Path.Length == 0 ? "Enter a file or a pattern."
+                    : _entries.Any(e => e.Key == entry.Key) ? $"{entry.App} · {entry.Path} is already on the list."
+                    : null;
+                if (_error is null) _entries.Add(entry);
+                Render();
+            };
+
+            var heading = Text("Add an image level", "Text.Caption");
             heading.Margin = new Thickness(0, 8, 0, 6);
             Body.Children.Add(heading);
             Body.Children.Add(grid);
